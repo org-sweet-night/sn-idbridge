@@ -108,9 +108,21 @@ type TokenInput struct {
 	CodeVerifier         string
 }
 
+// ClientCredentialsInput is a non-interactive token request made by a
+// confidential client on behalf of itself. It is intentionally separate from
+// TokenInput because it has no end-user, authorization code, redirect URI, or
+// PKCE verifier.
+type ClientCredentialsInput struct {
+	EntityID             string
+	ClientID             string
+	ClientSecret         string
+	ClientSecretProvided bool
+	Scopes               []string
+}
+
 type TokenResponse struct {
 	AccessToken string `json:"access_token"`
-	IDToken     string `json:"id_token"`
+	IDToken     string `json:"id_token,omitempty"`
 	TokenType   string `json:"token_type"`
 	ExpiresIn   int64  `json:"expires_in"`
 	Scope       string `json:"scope"`
@@ -438,6 +450,66 @@ func (s *Service) ExchangeCode(ctx context.Context, input TokenInput) (TokenResp
 	}, nil
 }
 
+// IssueClientCredentials issues a short-lived access token for a confidential
+// OIDC client. The token subject is the internal client ULID, never an end
+// user. Only scopes explicitly requested by the caller and allowed for that
+// client may be issued.
+func (s *Service) IssueClientCredentials(ctx context.Context, input ClientCredentialsInput) (TokenResponse, error) {
+	if s.store == nil {
+		return TokenResponse{}, fmt.Errorf("sso store is required")
+	}
+	if input.EntityID == "" || input.ClientID == "" || input.ClientSecret == "" || !input.ClientSecretProvided {
+		return TokenResponse{}, ErrInvalidClient
+	}
+	if len(input.Scopes) == 0 {
+		return TokenResponse{}, fmt.Errorf("scope is required for client_credentials")
+	}
+
+	client, err := s.getActiveClient(ctx, input.EntityID, input.ClientID)
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	if !containsString(client.GrantTypes, "client_credentials") {
+		return TokenResponse{}, fmt.Errorf("client_credentials is not enabled for this client")
+	}
+	if !client.ClientSecretHash.Valid || !constantTimeSecretEqual(client.ClientSecretHash.String, input.ClientSecret) {
+		return TokenResponse{}, ErrInvalidClient
+	}
+	scopes, err := effectiveClientCredentialScopes(input.Scopes, client.AllowedScopes)
+	if err != nil {
+		return TokenResponse{}, err
+	}
+
+	now := s.now()
+	subject := TokenSubject{
+		EntityID:          input.EntityID,
+		UserID:            client.ID,
+		ClientID:          input.ClientID,
+		PreferredUsername: input.ClientID,
+	}
+	accessToken, err := SignRS256(BuildAccessTokenClaims(s.issuer, subject, scopes, now, s.accessTokenTTL), s.keyID, s.privateKey)
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	if _, err := s.store.CreateOAuthToken(ctx, generated.CreateOAuthTokenParams{
+		EntityID:  input.EntityID,
+		UserID:    client.ID,
+		ClientID:  input.ClientID,
+		TokenType: "access",
+		TokenHash: HashToken(accessToken),
+		Scopes:    scopes,
+		ExpiresAt: pgtype.Timestamptz{Time: now.Add(s.accessTokenTTL), Valid: true},
+	}); err != nil {
+		return TokenResponse{}, err
+	}
+	return TokenResponse{
+		AccessToken: accessToken,
+		TokenType:   "Bearer",
+		ExpiresIn:   int64(s.accessTokenTTL.Seconds()),
+		Scope:       strings.Join(scopes, " "),
+	}, nil
+}
+
 func (s *Service) authorizationCodeForExchange(ctx context.Context, entityIDValue string, codeHash string) (generated.OauthAuthorizationCode, error) {
 	if entityIDValue == "" {
 		return s.store.GetAuthorizationCodeByHash(ctx, codeHash)
@@ -605,6 +677,17 @@ func effectiveAuthorizeScopes(requested []string, allowed []string) ([]string, e
 		return uniqueStrings(allowed), nil
 	}
 	return uniqueStrings(requested), nil
+}
+
+func effectiveClientCredentialScopes(requested []string, allowed []string) ([]string, error) {
+	requested = uniqueStrings(requested)
+	if len(requested) == 0 {
+		return nil, fmt.Errorf("scope is required for client_credentials")
+	}
+	if !isSubset(requested, allowed) {
+		return nil, fmt.Errorf("requested scope is not allowed")
+	}
+	return requested, nil
 }
 
 func uniqueStrings(values []string) []string {

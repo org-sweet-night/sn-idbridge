@@ -135,7 +135,7 @@ func (h OIDCClientHandler) createOIDCClient(w http.ResponseWriter, r *http.Reque
 		AllowedScopes      []string `json:"allowed_scopes"`
 		GrantTypes         []string `json:"grant_types"`
 		ResponseTypes      []string `json:"response_types"`
-		PKCERequired       bool     `json:"pkce_required"`
+		PKCERequired       *bool    `json:"pkce_required"`
 		WorkplaceProvider  string   `json:"workplace_provider"`
 		WorkplaceAppID     string   `json:"workplace_app_id"`
 		WorkplaceAppSecret string   `json:"workplace_app_secret"`
@@ -161,21 +161,31 @@ func (h OIDCClientHandler) createOIDCClient(w http.ResponseWriter, r *http.Reque
 		}
 		body.ClientID = clientID
 	}
-	if len(body.AllowedScopes) == 0 {
+	if len(body.AllowedScopes) == 0 && !isClientCredentialsOnly(body.GrantTypes) {
+		// Preserve the legacy standalone OIDC-client endpoint's interactive
+		// defaults. Client-credentials clients must declare a narrow scope.
 		body.AllowedScopes = []string{"openid", "profile", "email", "directory:read"}
 	}
-	if len(body.GrantTypes) == 0 {
-		body.GrantTypes = []string{"authorization_code"}
+	input := ApplicationOIDCClientInput{
+		ClientID:           body.ClientID,
+		RedirectURIs:       body.RedirectURIs,
+		AllowedScopes:      body.AllowedScopes,
+		GrantTypes:         body.GrantTypes,
+		ResponseTypes:      body.ResponseTypes,
+		PKCERequired:       body.PKCERequired,
+		WorkplaceProvider:  &body.WorkplaceProvider,
+		WorkplaceAppID:     &body.WorkplaceAppID,
+		WorkplaceAppSecret: &body.WorkplaceAppSecret,
 	}
-	if len(body.ResponseTypes) == 0 {
-		body.ResponseTypes = []string{"code"}
-	}
-	body.RedirectURIs, err = normalizeOIDCRedirectURIs(body.RedirectURIs, true)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_redirect_uris", err.Error())
+	if err := normalizeOIDCClientCreate(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_oidc_client", err.Error())
 		return
 	}
-	body.PKCERequired = true
+	body.RedirectURIs = input.RedirectURIs
+	body.AllowedScopes = input.AllowedScopes
+	body.GrantTypes = input.GrantTypes
+	body.ResponseTypes = input.ResponseTypes
+	body.PKCERequired = input.PKCERequired
 	workplaceProvider, workplaceAppID, workplaceAppSecret, err := normalizeWorkplaceConfig(body.WorkplaceProvider, body.WorkplaceAppID, body.WorkplaceAppSecret)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_workplace_config", err.Error())
@@ -190,7 +200,7 @@ func (h OIDCClientHandler) createOIDCClient(w http.ResponseWriter, r *http.Reque
 		AllowedScopes:      body.AllowedScopes,
 		GrantTypes:         body.GrantTypes,
 		ResponseTypes:      body.ResponseTypes,
-		PkceRequired:       body.PKCERequired,
+		PkceRequired:       *body.PKCERequired,
 		WorkplaceProvider:  workplaceProvider,
 		WorkplaceAppID:     workplaceAppID,
 		WorkplaceAppSecret: workplaceAppSecret,

@@ -269,12 +269,61 @@ func TestExchangeCodeConsumesCodeAndPersistsTokensAtomically(t *testing.T) {
 	}
 }
 
+func TestIssueClientCredentialsIssuesScopedServiceToken(t *testing.T) {
+	store := newExchangeTestStore()
+	store.client.GrantTypes = []string{"client_credentials"}
+	store.client.AllowedScopes = []string{"directory:read"}
+	service := newExchangeTestService(t, store)
+
+	response, err := service.IssueClientCredentials(context.Background(), ClientCredentialsInput{
+		EntityID:             store.client.EntityID,
+		ClientID:             store.client.ClientID,
+		ClientSecret:         store.client.ClientSecretHash.String,
+		ClientSecretProvided: true,
+		Scopes:               []string{"directory:read"},
+	})
+	if err != nil {
+		t.Fatalf("IssueClientCredentials() error = %v", err)
+	}
+	if response.AccessToken == "" || response.IDToken != "" || response.Scope != "directory:read" {
+		t.Fatalf("response = %#v", response)
+	}
+	if store.createTokenCalls != 1 {
+		t.Fatalf("CreateOAuthToken() calls = %d, want 1", store.createTokenCalls)
+	}
+	if store.lastToken.UserID != store.client.ID || store.lastToken.ClientID != store.client.ClientID {
+		t.Fatalf("persisted token = %#v, want client subject", store.lastToken)
+	}
+}
+
+func TestIssueClientCredentialsRejectsUnapprovedScope(t *testing.T) {
+	store := newExchangeTestStore()
+	store.client.GrantTypes = []string{"client_credentials"}
+	store.client.AllowedScopes = []string{"directory:read"}
+	service := newExchangeTestService(t, store)
+
+	_, err := service.IssueClientCredentials(context.Background(), ClientCredentialsInput{
+		EntityID:             store.client.EntityID,
+		ClientID:             store.client.ClientID,
+		ClientSecret:         store.client.ClientSecretHash.String,
+		ClientSecretProvided: true,
+		Scopes:               []string{"profile"},
+	})
+	if err == nil {
+		t.Fatal("IssueClientCredentials() error = nil, want rejected scope")
+	}
+	if store.createTokenCalls != 0 {
+		t.Fatalf("CreateOAuthToken() calls = %d, want 0", store.createTokenCalls)
+	}
+}
+
 type exchangeTestStore struct {
 	code             generated.OauthAuthorizationCode
 	client           generated.OidcClient
 	finalizeCalls    int
 	markUsedCalls    int
 	createTokenCalls int
+	lastToken        generated.CreateOAuthTokenParams
 }
 
 func newExchangeTestStore() *exchangeTestStore {
@@ -376,8 +425,9 @@ func (s *exchangeTestStore) MarkAuthorizationCodeUsed(context.Context, generated
 	s.markUsedCalls++
 	return s.code, nil
 }
-func (s *exchangeTestStore) CreateOAuthToken(context.Context, generated.CreateOAuthTokenParams) (generated.OauthToken, error) {
+func (s *exchangeTestStore) CreateOAuthToken(_ context.Context, arg generated.CreateOAuthTokenParams) (generated.OauthToken, error) {
 	s.createTokenCalls++
+	s.lastToken = arg
 	return generated.OauthToken{}, nil
 }
 func (s *exchangeTestStore) FinalizeAuthorizationCodeExchange(context.Context, generated.FinalizeAuthorizationCodeExchangeParams) (generated.FinalizeAuthorizationCodeExchangeRow, error) {

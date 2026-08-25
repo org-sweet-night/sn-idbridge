@@ -75,3 +75,48 @@ func TestNormalizeOIDCRedirectURIsTrimsAndRejectsInvalidValues(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeOIDCClientCreateSupportsNonInteractiveClientCredentials(t *testing.T) {
+	input := ApplicationOIDCClientInput{
+		AllowedScopes: []string{"directory:read"},
+		GrantTypes:    []string{"client_credentials"},
+	}
+
+	if err := normalizeOIDCClientCreate(&input); err != nil {
+		t.Fatalf("normalizeOIDCClientCreate() error = %v", err)
+	}
+	if len(input.RedirectURIs) != 0 || len(input.ResponseTypes) != 0 {
+		t.Fatalf("non-interactive client carried browser fields: %#v", input)
+	}
+	if input.PKCERequired == nil || *input.PKCERequired {
+		t.Fatalf("pkce_required = %#v, want explicit false", input.PKCERequired)
+	}
+}
+
+func TestNormalizeOIDCClientCreateRejectsInteractiveFieldsOnClientCredentials(t *testing.T) {
+	pkce := true
+	for _, input := range []ApplicationOIDCClientInput{
+		{
+			AllowedScopes: []string{"directory:read"},
+			GrantTypes:    []string{"client_credentials"},
+			RedirectURIs:  []string{"https://client.example/callback"},
+		},
+		{
+			AllowedScopes: []string{"directory:read"},
+			GrantTypes:    []string{"client_credentials"},
+			ResponseTypes: []string{"code"},
+		},
+		{
+			AllowedScopes: []string{"directory:read"},
+			GrantTypes:    []string{"client_credentials"},
+			PKCERequired:  &pkce,
+		},
+		{
+			GrantTypes: []string{"client_credentials"},
+		},
+	} {
+		if err := normalizeOIDCClientCreate(&input); err == nil {
+			t.Fatalf("normalizeOIDCClientCreate(%#v) error = nil", input)
+		}
+	}
+}

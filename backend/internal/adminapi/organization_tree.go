@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,6 +19,9 @@ import (
 
 const organizationTreeCacheTTL = 15 * time.Minute
 const organizationTreeVersionTTL = 30 * 24 * time.Hour
+const maxExternalReferences = 32
+const maxExternalReferenceKeyLength = 64
+const maxExternalReferenceValueLength = 256
 
 type OrganizationTreeCache struct {
 	store ephemeral.Store
@@ -90,6 +94,7 @@ type OrganizationTreeNode struct {
 	JobTitle             string                   `json:"job_title,omitempty"`
 	Email                string                   `json:"email,omitempty"`
 	Phone                string                   `json:"phone,omitempty"`
+	ExternalReferences   map[string]string        `json:"external_references,omitempty"`
 	Status               string                   `json:"status,omitempty"`
 	HasChildren          bool                     `json:"has_children"`
 	UpdatedAt            time.Time                `json:"updated_at,omitempty"`
@@ -305,7 +310,13 @@ func (s *AdminService) listDepartmentTreeChildren(ctx context.Context, entityID 
 		return nil, err
 	}
 	for _, row := range userRows {
-		nodes = append(nodes, directoryUserTreeNode(row))
+		node, included, err := s.boundDirectoryUserTreeNode(ctx, entityID, row)
+		if err != nil {
+			return nil, err
+		}
+		if included {
+			nodes = append(nodes, node)
+		}
 	}
 	return nodes, nil
 }
@@ -376,21 +387,95 @@ func (s *AdminService) departmentTreeNode(ctx context.Context, row generated.Dep
 	}
 }
 
-func directoryUserTreeNode(row generated.DirectoryUser) OrganizationTreeNode {
+func directoryUserTreeNode(row generated.DirectoryUser, subjectID string) OrganizationTreeNode {
 	return OrganizationTreeNode{
-		ID:          row.ID,
-		Kind:        organizationTreeKindUser,
-		Name:        row.Name,
-		SourceID:    row.SourceID,
-		EnglishName: row.EnglishName,
-		EmployeeNo:  row.EmployeeNo,
-		JobTitle:    row.JobTitle,
-		Email:       textString(row.Email),
-		Phone:       textString(row.Phone),
-		Status:      row.Status,
-		HasChildren: false,
-		UpdatedAt:   row.UpdatedAt.Time,
+		ID:                 subjectID,
+		Kind:               organizationTreeKindUser,
+		Name:               row.Name,
+		SourceID:           row.SourceID,
+		EnglishName:        row.EnglishName,
+		EmployeeNo:         row.EmployeeNo,
+		JobTitle:           row.JobTitle,
+		Email:              textString(row.Email),
+		Phone:              textString(row.Phone),
+		ExternalReferences: directoryUserExternalReferences(row.RawProfile),
+		Status:             row.Status,
+		HasChildren:        false,
+		UpdatedAt:          row.UpdatedAt.Time,
 	}
+}
+
+// boundDirectoryUserTreeNode emits only users with one managed IdBridge
+// subject. OIDC tokens use the managed user's ID as `sub`; exposing the raw
+// directory-row ID here would make the assertion-to-directory join ambiguous.
+// An unbound source user is intentionally not eligible for the OAuth directory
+// projection, and a database failure aborts the response rather than guessing.
+func (s *AdminService) boundDirectoryUserTreeNode(ctx context.Context, entityID string, row generated.DirectoryUser) (OrganizationTreeNode, bool, error) {
+	binding, err := s.queries.GetAccountBindingByDirectoryUserID(ctx, generated.GetAccountBindingByDirectoryUserIDParams{
+		EntityID: entityID, SourceID: row.SourceID, DirectoryUserID: row.ID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return OrganizationTreeNode{}, false, nil
+	}
+	if err != nil {
+		return OrganizationTreeNode{}, false, err
+	}
+	if binding.UserID == "" {
+		return OrganizationTreeNode{}, false, nil
+	}
+	lifecycleStatus, err := s.queries.GetUserLifecycleStatus(ctx, generated.GetUserLifecycleStatusParams{
+		EntityID: entityID, ID: binding.UserID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return OrganizationTreeNode{}, false, nil
+	}
+	if err != nil {
+		return OrganizationTreeNode{}, false, err
+	}
+	node := directoryUserTreeNode(row, binding.UserID)
+	if lifecycleStatus != "active" {
+		node.Status = lifecycleStatus
+	}
+	return node, true, nil
+}
+
+// directoryUserExternalReferences projects only a small, opaque, string-only
+// subset of source metadata. It gives an enterprise directory a stable join
+// point for customer business identifiers without leaking a source RawProfile
+// or allowing arbitrary nested provider data onto the directory API.
+func directoryUserExternalReferences(rawProfile []byte) map[string]string {
+	var profile struct {
+		ExternalReferences map[string]json.RawMessage `json:"external_references"`
+	}
+	if len(rawProfile) == 0 || json.Unmarshal(rawProfile, &profile) != nil {
+		return nil
+	}
+	if len(profile.ExternalReferences) > maxExternalReferences {
+		return nil
+	}
+	references := make(map[string]string, len(profile.ExternalReferences))
+	for key, rawValue := range profile.ExternalReferences {
+		if !validExternalReferenceKey(key) {
+			continue
+		}
+		var value string
+		if json.Unmarshal(rawValue, &value) != nil || !validExternalReferenceValue(value) {
+			continue
+		}
+		references[key] = value
+	}
+	if len(references) == 0 {
+		return nil
+	}
+	return references
+}
+
+func validExternalReferenceKey(value string) bool {
+	return value != "" && value == strings.TrimSpace(value) && len(value) <= maxExternalReferenceKeyLength
+}
+
+func validExternalReferenceValue(value string) bool {
+	return value != "" && value == strings.TrimSpace(value) && len(value) <= maxExternalReferenceValueLength
 }
 
 func (s *AdminService) listRootDirectoryUsers(ctx context.Context, entityID string, limit, offset int32) ([]OrganizationTreeNode, error) {
@@ -404,7 +489,13 @@ func (s *AdminService) listRootDirectoryUsers(ctx context.Context, entityID stri
 	}
 	nodes := make([]OrganizationTreeNode, 0, len(userRows))
 	for _, row := range userRows {
-		nodes = append(nodes, directoryUserTreeNode(row))
+		node, included, err := s.boundDirectoryUserTreeNode(ctx, entityID, row)
+		if err != nil {
+			return nil, err
+		}
+		if included {
+			nodes = append(nodes, node)
+		}
 	}
 	return nodes, nil
 }
@@ -439,7 +530,13 @@ func (s *AdminService) SearchOrganizationTree(ctx context.Context, entityID, que
 		nodes = append(nodes, s.departmentTreeNode(ctx, row))
 	}
 	for _, row := range userRows {
-		nodes = append(nodes, directoryUserTreeNode(row))
+		node, included, err := s.boundDirectoryUserTreeNode(ctx, entityID, row)
+		if err != nil {
+			return OrganizationTreeSearchResponse{}, err
+		}
+		if included {
+			nodes = append(nodes, node)
+		}
 	}
 	return OrganizationTreeSearchResponse{
 		Items:  nodes,
