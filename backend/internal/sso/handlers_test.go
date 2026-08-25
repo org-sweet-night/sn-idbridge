@@ -143,6 +143,39 @@ func TestAPIAuthorizeRedirectsToLoginWhenUnauthenticated(t *testing.T) {
 	}
 }
 
+func TestTokenEndpointIssuesClientCredentials(t *testing.T) {
+	store := newExchangeTestStore()
+	store.client.GrantTypes = []string{"client_credentials"}
+	store.client.AllowedScopes = []string{"directory:read"}
+	service := newExchangeTestService(t, store)
+	handler := NewHandler(service)
+	router := chi.NewRouter()
+	handler.RegisterRoutes(router)
+
+	form := url.Values{
+		"grant_type": {"client_credentials"},
+		"scope":      {"directory:read"},
+		"entity_id":  {store.client.EntityID},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(store.client.ClientID, store.client.ClientSecretHash.String)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var response TokenResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.AccessToken == "" || response.IDToken != "" || response.Scope != "directory:read" {
+		t.Fatalf("response = %#v", response)
+	}
+}
+
 func TestAuthorizationRedirectURLPreservesQueryAndEncodesSuccessParameters(t *testing.T) {
 	got, err := authorizationRedirectURL(
 		"https://client.example/callback?tenant=alpha#complete",

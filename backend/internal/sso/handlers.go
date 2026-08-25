@@ -194,8 +194,9 @@ func (h Handler) token(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_token_request", "invalid form body")
 		return
 	}
-	if grantType := r.PostForm.Get("grant_type"); grantType != "authorization_code" {
-		writeError(w, http.StatusBadRequest, "unsupported_grant_type", "grant_type must be authorization_code")
+	grantType := r.PostForm.Get("grant_type")
+	if grantType != "authorization_code" && grantType != "client_credentials" {
+		writeError(w, http.StatusBadRequest, "unsupported_grant_type", "grant_type must be authorization_code or client_credentials")
 		return
 	}
 	clientID, clientSecret, clientSecretProvided, err := tokenClientCredentials(r)
@@ -215,22 +216,38 @@ func (h Handler) token(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := h.service.ExchangeCode(r.Context(), TokenInput{
-		EntityID:             firstNonEmpty(r.Header.Get("X-IDB-Entity-ID"), r.PostForm.Get("entity_id")),
-		ClientID:             clientID,
-		ClientSecret:         clientSecret,
-		ClientSecretProvided: clientSecretProvided,
-		Code:                 r.PostForm.Get("code"),
-		RedirectURI:          r.PostForm.Get("redirect_uri"),
-		CodeVerifier:         r.PostForm.Get("code_verifier"),
-	})
+	entityID := firstNonEmpty(r.Header.Get("X-IDB-Entity-ID"), r.PostForm.Get("entity_id"))
+	var response TokenResponse
+	if grantType == "client_credentials" {
+		response, err = h.service.IssueClientCredentials(r.Context(), ClientCredentialsInput{
+			EntityID:             entityID,
+			ClientID:             clientID,
+			ClientSecret:         clientSecret,
+			ClientSecretProvided: clientSecretProvided,
+			Scopes:               splitScopes(r.PostForm.Get("scope")),
+		})
+	} else {
+		response, err = h.service.ExchangeCode(r.Context(), TokenInput{
+			EntityID:             entityID,
+			ClientID:             clientID,
+			ClientSecret:         clientSecret,
+			ClientSecretProvided: clientSecretProvided,
+			Code:                 r.PostForm.Get("code"),
+			RedirectURI:          r.PostForm.Get("redirect_uri"),
+			CodeVerifier:         r.PostForm.Get("code_verifier"),
+		})
+	}
 	if err != nil {
 		if errors.Is(err, ErrInvalidClient) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="oauth2/token"`)
 			writeError(w, http.StatusUnauthorized, "invalid_client", err.Error())
 			return
 		}
-		writeError(w, http.StatusBadRequest, "invalid_grant", err.Error())
+		code := "invalid_grant"
+		if grantType == "client_credentials" {
+			code = "invalid_scope"
+		}
+		writeError(w, http.StatusBadRequest, code, err.Error())
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
