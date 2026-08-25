@@ -570,17 +570,64 @@ func normalizeCompleteApplicationCreate(input *ApplicationWriteInput) error {
 		if input.OIDCClient == nil {
 			return &applicationRequestError{message: "oidc_client settings are required"}
 		}
-		redirectURIs, err := normalizeOIDCRedirectURIs(input.OIDCClient.RedirectURIs, true)
-		if err != nil {
-			return err
-		}
-		input.OIDCClient.RedirectURIs = redirectURIs
+		return normalizeOIDCClientCreate(input.OIDCClient)
 	case "api_client", "internal_app":
 		if !applicationConfigProvided(input.Config) {
 			return &applicationRequestError{message: input.Type + " config is required"}
 		}
 	}
 	return nil
+}
+
+// normalizeOIDCClientCreate distinguishes non-interactive confidential clients
+// from browser-facing authorization-code clients. A client_credentials-only
+// client has no redirect or response flow and therefore must not carry an
+// unused callback or PKCE setting. Interactive clients retain the existing
+// redirect and PKCE defaults.
+func normalizeOIDCClientCreate(input *ApplicationOIDCClientInput) error {
+	if len(input.GrantTypes) == 0 {
+		input.GrantTypes = []string{"authorization_code"}
+	}
+	if isClientCredentialsOnly(input.GrantTypes) {
+		if len(input.RedirectURIs) > 0 {
+			return &applicationRequestError{message: "client_credentials clients must not declare redirect_uris"}
+		}
+		if len(input.ResponseTypes) > 0 {
+			return &applicationRequestError{message: "client_credentials clients must not declare response_types"}
+		}
+		if input.PKCERequired != nil && *input.PKCERequired {
+			return &applicationRequestError{message: "client_credentials clients must disable pkce_required"}
+		}
+		if len(input.AllowedScopes) == 0 {
+			return &applicationRequestError{message: "client_credentials clients require explicit allowed_scopes"}
+		}
+		input.RedirectURIs = []string{}
+		input.ResponseTypes = []string{}
+		pkceRequired := false
+		input.PKCERequired = &pkceRequired
+		return nil
+	}
+
+	redirectURIs, err := normalizeOIDCRedirectURIs(input.RedirectURIs, true)
+	if err != nil {
+		return err
+	}
+	input.RedirectURIs = redirectURIs
+	if len(input.AllowedScopes) == 0 {
+		input.AllowedScopes = []string{"openid", "profile", "email"}
+	}
+	if len(input.ResponseTypes) == 0 {
+		input.ResponseTypes = []string{"code"}
+	}
+	if input.PKCERequired == nil {
+		pkceRequired := true
+		input.PKCERequired = &pkceRequired
+	}
+	return nil
+}
+
+func isClientCredentialsOnly(grantTypes []string) bool {
+	return len(grantTypes) == 1 && grantTypes[0] == "client_credentials"
 }
 
 func normalizeOIDCRedirectURIs(values []string, required bool) ([]string, error) {
@@ -694,11 +741,9 @@ func applicationDetailFromQueries(ctx context.Context, queries *generated.Querie
 }
 
 func newOIDCClientParams(entityID, applicationID, status string, input ApplicationOIDCClientInput) (generated.CreateOIDCClientParams, error) {
-	redirectURIs, err := normalizeOIDCRedirectURIs(input.RedirectURIs, true)
-	if err != nil {
+	if err := normalizeOIDCClientCreate(&input); err != nil {
 		return generated.CreateOIDCClientParams{}, err
 	}
-	input.RedirectURIs = redirectURIs
 	clientID := strings.TrimSpace(input.ClientID)
 	if clientID == "" {
 		var err error
@@ -711,22 +756,7 @@ func newOIDCClientParams(entityID, applicationID, status string, input Applicati
 	if err != nil {
 		return generated.CreateOIDCClientParams{}, err
 	}
-	if len(input.AllowedScopes) == 0 {
-		input.AllowedScopes = []string{"openid", "profile", "email"}
-	}
-	if len(input.GrantTypes) == 0 {
-		input.GrantTypes = []string{"authorization_code"}
-	}
-	if len(input.ResponseTypes) == 0 {
-		input.ResponseTypes = []string{"code"}
-	}
-	if input.RedirectURIs == nil {
-		input.RedirectURIs = []string{}
-	}
-	pkceRequired := true
-	if input.PKCERequired != nil {
-		pkceRequired = *input.PKCERequired
-	}
+	pkceRequired := *input.PKCERequired
 	provider, appID, appSecret, err := normalizeWorkplaceConfig(
 		stringPointerValue(input.WorkplaceProvider),
 		stringPointerValue(input.WorkplaceAppID),
