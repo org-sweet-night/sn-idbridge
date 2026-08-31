@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/smices/open-idb/internal/auth"
+	"github.com/smices/open-idb/internal/clientsecret"
 	"github.com/smices/open-idb/internal/db/generated"
 	"github.com/smices/open-idb/internal/httpserver"
 	"github.com/smices/open-idb/internal/sso"
@@ -295,7 +296,7 @@ func createOIDCTestClient(ctx context.Context, t *testing.T, queries *generated.
 		EntityID:           entityID,
 		ApplicationID:      app.ID,
 		ClientID:           clientID,
-		ClientSecretHash:   pgtype.Text{String: "secret-1", Valid: true},
+		ClientSecretHash:   pgtype.Text{String: clientsecret.Hash("secret-1"), Valid: true},
 		RedirectUris:       []string{redirectURI},
 		AllowedScopes:      []string{"openid", "profile", "email"},
 		GrantTypes:         []string{"authorization_code"},

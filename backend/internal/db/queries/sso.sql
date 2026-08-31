@@ -104,7 +104,7 @@ WITH consumed AS (
                 )
                 OR (
                     sqlc.arg('client_secret_provided')::boolean
-                    AND client.client_secret_hash = sqlc.arg('client_secret')
+                    AND client.client_secret_hash = sqlc.arg('client_secret_verifier')
                 )
             )
       )

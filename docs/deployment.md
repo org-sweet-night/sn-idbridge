@@ -165,6 +165,29 @@ goose -dir /app/migrations postgres "$DATABASE_URL" up
 
 首次登录后必须立即修改默认管理员密码。管理员账号和普通用户账号完全隔离，初始化管理员不属于业务用户数。
 
+### 4.1 非生产 sandbox bootstrap
+
+受控的非生产 GitOps 环境可在迁移完成后运行：
+
+```bash
+/usr/local/bin/idbridge bootstrap sandbox
+```
+
+该命令只读取 `DATABASE_URL`、`IDB_DEFAULT_LOCALE` 和以下预投影字段：
+`IDBRIDGE_ENTITY_SLUG`、`IDBRIDGE_ENTITY_NAME`、`IDBRIDGE_ADMIN_USERNAME`、
+`IDBRIDGE_ADMIN_PASSWORD`、`IDBRIDGE_ADMIN_ROLE`、
+`IDBRIDGE_DIRECTORY_READER_APPLICATION_NAME`、
+`IDBRIDGE_DIRECTORY_READER_CLIENT_ID`、
+`IDBRIDGE_DIRECTORY_READER_CLIENT_SECRET`、`IDBRIDGE_FIXTURE_SOURCE_NAME`、
+`IDBRIDGE_FIXTURE_OWNER_USERNAME`、`IDBRIDGE_FIXTURE_OWNER_TROBS_USER_ID`、
+`IDBRIDGE_FIXTURE_UNRELATED_USERNAME` 和
+`IDBRIDGE_SANDBOX_SINGLE_DEVELOPER`。它不需要服务器签名密钥、管理员
+cookie、Kubernetes token 或 secret-manager 写权限，也不会输出密码或 client secret。
+
+命令通过应用事务和审计记录创建缺失资源；现有资源必须精确满足安全契约，否则失败，不会静默轮换 credential 或重绑账号。角色
+`isa:pam:requester` 与 `isa:pam:approver` 由显式 sandbox policy 分配；
+`trobs_user_id` 只是 opaque 外部引用，不能推导授权。此命令不得用于生产初始化。
+
 ## 5. 构建镜像
 
 后端：
@@ -239,17 +262,30 @@ pg_restore --clean --if-exists --no-owner --dbname="$DATABASE_URL" idbridge-YYYY
 
 1. 记录当前镜像版本、迁移版本和所有 Secret，并完成数据库备份。
 2. 对备份恢复出的非生产数据库执行 `goose status` 和 `goose up`，验证迁移可重复检查且现有数据可读取。
-3. 在生产维护窗口先执行 `goose up`。不要执行 `goose down`，也不要重新导入 `000001_schema_baseline.sql`。
-4. 保持原有 `IDB_OIDC_PRIVATE_KEY_PEM`、`IDB_OIDC_KEY_ID` 和现有域名不变，逐个替换 backend 副本，等待 `/readyz` 成功后再替换下一个。
-5. backend 全部就绪后再发布 frontend 静态资源。
-6. 验证一个既有管理员会话、一个既有用户登录、一个既有 OIDC client 的授权码换票，以及一次身份源读取；无需删除或重建任何现有应用。
-7. 如需回滚程序镜像，保留已经执行的向前兼容增量列，不要回滚数据库迁移。若期间已启用身份源配置加密，则按 3.3 节保留新程序与密钥，或恢复启用前备份。
+3. 检查待执行迁移是否包含 `000011_oidc_client_secret_verifiers.sql`。若包含，必须进入维护窗口、停止新 token 请求并先排空全部旧 backend；旧程序只会比较明文，不能读取迁移后的单向 verifier。排空后执行 `goose up`，再一次性发布 verifier-aware backend，全部 `/readyz` 成功后才恢复流量。该迁移不能使用旧/新副本并存的滚动顺序。
+4. 不包含 `000011` 的兼容增量迁移可按原滚动顺序执行。任何路径都不要执行 `goose down`，也不要重新导入 `000001_schema_baseline.sql`。
+5. 保持原有 client secret、`IDB_OIDC_PRIVATE_KEY_PEM`、`IDB_OIDC_KEY_ID` 和现有域名不变；`000011` 只转换存储 verifier，调用方无需轮换 secret。
+6. backend 全部就绪后再发布 frontend 静态资源。
+7. 验证一个既有管理员会话、一个既有用户登录、一个既有 OIDC client 的授权码换票，以及一次身份源读取；无需删除或重建任何现有应用。
+8. `000011` 的数据转换不可逆；执行后不得回滚到明文比较的旧镜像。故障必须向前修复，或在明确接受迁移后数据丢失的灾难恢复流程中恢复迁移前备份。其他向前兼容迁移仍保留已执行数据库版本。若期间已启用身份源配置加密，则按 3.3 节保留新程序与密钥，或恢复启用前备份。
 
 全量同步的清理语义比旧版本更严格。首次升级后执行全量同步前，应先在恢复出的非生产副本核对源端快照和清理结果；生产环境是否触发同步由部署方在维护窗口决定。
 
 `000007_webhook_recovery.sql` 只给 `sync_jobs` 增加恢复元数据、索引和独立的 source lease 表，不删除或改写用户、应用、绑定和既有同步记录。新 backend 启动后会立即检查未完成的 webhook job，之后默认每 30 秒检查一次；多副本通过数据库 lease 避免同一身份源被同时领取。执行失败的 webhook job 会按 1 分钟、5 分钟、30 分钟、2 小时退避，累计 5 次失败后才进入终态 `failed`，成功消费则进入 `succeeded`。发布期间旧副本仍可按原 SQL 写入，新增列的默认值保证这些记录可由新副本恢复。
 
 `000007` 和 `000009` 使用 PostgreSQL 并发索引并由 goose 以非事务方式逐步执行，避免在历史回填和建索引期间持续阻塞生产写入；迁移步骤可安全重试，不要在外层额外包裹事务。`000008` 会把既有 OIDC client 标记为 `secret_required=false`，保持原换票行为；升级后由新后台创建的 client 才会显式标记为 `true`。`000009` 只增加授权码/token hash 查询索引，不改变凭证数据。
+
+`000011` 使用 `pgcrypto` 把非空 legacy `client_secret_hash` 原地转换成
+`sha256:<lowercase-hex>` verifier，并加格式约束。迁移不会把 plaintext
+写入临时表或日志；Down 只能移除约束，无法也不得恢复 plaintext。创建和
+rotate API 只在当次响应返回新 secret，详情、普通更新和 bootstrap rerun
+不再返回它。Sandbox bootstrap 用 projected secret 验证现有 verifier；不匹配
+会以 credential drift 失败，绝不会静默轮换。
+
+SN cutover 的迁移编号以本目录为唯一分配源：`000011` 已保留给本次
+verifier 转换。其他工作树中尚未发布的 full-sync lease、TROBS provenance
+或类似迁移必须先基于该提交重排到下一个可用编号，再进入同一发布序列；不能
+直接复制相同编号，也不能把未获批准的 TROBS 授权语义带入本合约。
 
 ## 7. 反向代理配置
 

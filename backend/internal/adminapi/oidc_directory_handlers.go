@@ -4,10 +4,12 @@ package adminapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/smices/open-idb/internal/sso"
 )
 
@@ -17,15 +19,20 @@ type oidcDirectoryTokenService interface {
 	IntrospectToken(ctx context.Context, entityID, tokenHash string) (sso.SSOTokenLookup, error)
 }
 
+type oidcDirectoryService interface {
+	organizationService
+	GetDirectorySubject(ctx context.Context, entityID, subjectID string) (OrganizationTreeNode, error)
+}
+
 // OIDCDirectoryHandler exposes the synchronized organization read model to
 // authorized OIDC clients. It intentionally uses bearer-token auth instead of
 // admin sessions so business applications can power people pickers and search.
 type OIDCDirectoryHandler struct {
-	directory organizationService
+	directory oidcDirectoryService
 	tokens    oidcDirectoryTokenService
 }
 
-func NewOIDCDirectoryHandler(directory organizationService, tokens oidcDirectoryTokenService) OIDCDirectoryHandler {
+func NewOIDCDirectoryHandler(directory oidcDirectoryService, tokens oidcDirectoryTokenService) OIDCDirectoryHandler {
 	return OIDCDirectoryHandler{directory: directory, tokens: tokens}
 }
 
@@ -33,6 +40,29 @@ func (h OIDCDirectoryHandler) RegisterRoutes(r chi.Router) {
 	r.Get("/api/directory/organization-tree/root", h.getOrganizationTreeRoot)
 	r.Get("/api/directory/organization-tree/children", h.listOrganizationTreeChildren)
 	r.Get("/api/directory/organization-tree/search", h.searchOrganizationTree)
+	r.Get("/api/directory/users/{subject_id}", h.getDirectorySubject)
+}
+
+func (h OIDCDirectoryHandler) getDirectorySubject(w http.ResponseWriter, r *http.Request) {
+	token, ok := h.requireDirectoryRead(w, r)
+	if !ok {
+		return
+	}
+	subjectID, err := ulidValue(strings.TrimSpace(chi.URLParam(r, "subject_id")))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_subject_id", "subject id must be a ULID")
+		return
+	}
+	subject, err := h.directory.GetDirectorySubject(r.Context(), token.EntityID, subjectID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "directory_subject_not_found", "active directory subject was not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "directory_subject_lookup_failed", "directory subject lookup failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, subject)
 }
 
 func (h OIDCDirectoryHandler) getOrganizationTreeRoot(w http.ResponseWriter, r *http.Request) {

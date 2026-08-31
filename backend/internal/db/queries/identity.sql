@@ -336,6 +336,36 @@ FROM users
 WHERE entity_id = $1 AND username = $2
 LIMIT 1;
 
+-- name: GetActiveDirectoryUserByManagedUserID :one
+SELECT du.id, du.entity_id, du.source_id, du.external_user_id, du.external_union_id,
+       du.external_open_id, du.name, du.english_name, du.employee_no,
+       du.job_title, du.email, du.phone, du.avatar_url, du.status,
+       du.raw_profile, du.last_synced_at, du.created_at, du.updated_at
+FROM users managed
+JOIN account_bindings binding
+  ON binding.entity_id = managed.entity_id
+ AND binding.user_id = managed.id
+JOIN directory_users du
+  ON du.entity_id = binding.entity_id
+ AND du.source_id = binding.source_id
+ AND du.id = binding.directory_user_id
+WHERE managed.entity_id = $1
+  AND managed.id = $2
+  AND managed.lifecycle_status = 'active'
+  AND du.status = 'active'
+ORDER BY binding.is_primary DESC, binding.bound_at ASC, du.id ASC
+LIMIT 1;
+
+-- name: CountCurrentDirectoryUsersBySource :one
+SELECT count(*)::bigint
+FROM directory_users
+WHERE entity_id = $1 AND source_id = $2 AND status <> 'deleted';
+
+-- name: CountCurrentDirectoryDepartmentsBySource :one
+SELECT count(*)::bigint
+FROM directory_departments
+WHERE entity_id = $1 AND source_id = $2;
+
 -- name: GetManagedUserByBinding :one
 SELECT u.id, u.entity_id, u.username, u.display_name, u.english_name, u.employee_no, u.job_title, u.email, u.phone, u.avatar_url, u.lifecycle_status, u.user_type, u.primary_source_id, u.locale, u.created_at, u.updated_at
 FROM users u

@@ -11,6 +11,42 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countCurrentDirectoryDepartmentsBySource = `-- name: CountCurrentDirectoryDepartmentsBySource :one
+SELECT count(*)::bigint
+FROM directory_departments
+WHERE entity_id = $1 AND source_id = $2
+`
+
+type CountCurrentDirectoryDepartmentsBySourceParams struct {
+	EntityID string `json:"entity_id"`
+	SourceID string `json:"source_id"`
+}
+
+func (q *Queries) CountCurrentDirectoryDepartmentsBySource(ctx context.Context, arg CountCurrentDirectoryDepartmentsBySourceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countCurrentDirectoryDepartmentsBySource, arg.EntityID, arg.SourceID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const countCurrentDirectoryUsersBySource = `-- name: CountCurrentDirectoryUsersBySource :one
+SELECT count(*)::bigint
+FROM directory_users
+WHERE entity_id = $1 AND source_id = $2 AND status <> 'deleted'
+`
+
+type CountCurrentDirectoryUsersBySourceParams struct {
+	EntityID string `json:"entity_id"`
+	SourceID string `json:"source_id"`
+}
+
+func (q *Queries) CountCurrentDirectoryUsersBySource(ctx context.Context, arg CountCurrentDirectoryUsersBySourceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countCurrentDirectoryUsersBySource, arg.EntityID, arg.SourceID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const countEntities = `-- name: CountEntities :one
 SELECT count(*) FROM business_entities
 `
@@ -390,6 +426,58 @@ func (q *Queries) GetAccountBindingByProviderUnionID(ctx context.Context, arg Ge
 		&i.ProviderUnionID,
 		&i.IsPrimary,
 		&i.BoundAt,
+	)
+	return i, err
+}
+
+const getActiveDirectoryUserByManagedUserID = `-- name: GetActiveDirectoryUserByManagedUserID :one
+SELECT du.id, du.entity_id, du.source_id, du.external_user_id, du.external_union_id,
+       du.external_open_id, du.name, du.english_name, du.employee_no,
+       du.job_title, du.email, du.phone, du.avatar_url, du.status,
+       du.raw_profile, du.last_synced_at, du.created_at, du.updated_at
+FROM users managed
+JOIN account_bindings binding
+  ON binding.entity_id = managed.entity_id
+ AND binding.user_id = managed.id
+JOIN directory_users du
+  ON du.entity_id = binding.entity_id
+ AND du.source_id = binding.source_id
+ AND du.id = binding.directory_user_id
+WHERE managed.entity_id = $1
+  AND managed.id = $2
+  AND managed.lifecycle_status = 'active'
+  AND du.status = 'active'
+ORDER BY binding.is_primary DESC, binding.bound_at ASC, du.id ASC
+LIMIT 1
+`
+
+type GetActiveDirectoryUserByManagedUserIDParams struct {
+	EntityID string `json:"entity_id"`
+	ID       string `json:"id"`
+}
+
+func (q *Queries) GetActiveDirectoryUserByManagedUserID(ctx context.Context, arg GetActiveDirectoryUserByManagedUserIDParams) (DirectoryUser, error) {
+	row := q.db.QueryRow(ctx, getActiveDirectoryUserByManagedUserID, arg.EntityID, arg.ID)
+	var i DirectoryUser
+	err := row.Scan(
+		&i.ID,
+		&i.EntityID,
+		&i.SourceID,
+		&i.ExternalUserID,
+		&i.ExternalUnionID,
+		&i.ExternalOpenID,
+		&i.Name,
+		&i.EnglishName,
+		&i.EmployeeNo,
+		&i.JobTitle,
+		&i.Email,
+		&i.Phone,
+		&i.AvatarUrl,
+		&i.Status,
+		&i.RawProfile,
+		&i.LastSyncedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }

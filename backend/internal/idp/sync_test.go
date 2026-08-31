@@ -313,7 +313,12 @@ func TestFullSyncUsesExactUserIDAndReconcilesStaleIdentifierDuplicate(t *testing
 		Queries: queries,
 		Provider: fakeSyncDirectoryProvider{data: FullSyncData{
 			Departments: []DirectoryDepartment{{ExternalDepartmentID: "new_department_before_collision", Name: "Must Roll Back", RawProfile: []byte(`{}`)}},
-			Users:       []DirectoryUser{{ExternalUserID: "reused_user_id", ExternalOpenID: "stable_open_b", ExternalUnionID: "stable_union_b", Name: "Conflicting User", Status: "active", RawProfile: []byte(`{"user_id":"reused_user_id","open_id":"stable_open_b","union_id":"stable_union_b"}`)}},
+			Users: []DirectoryUser{
+				{ExternalUserID: "reused_user_id", ExternalOpenID: "stable_open_b", ExternalUnionID: "stable_union_b", Name: "Conflicting User", Status: "active", RawProfile: []byte(`{"user_id":"reused_user_id","open_id":"stable_open_b","union_id":"stable_union_b"}`)},
+				// Keep the snapshot size stable so the destructive-shrink guard does not mask
+				// the stale-identifier reconciliation this test exercises.
+				{ExternalUserID: "new_snapshot_user", ExternalOpenID: "new_snapshot_open", ExternalUnionID: "new_snapshot_union", Name: "Snapshot User", Status: "active", RawProfile: []byte(`{"user_id":"new_snapshot_user","open_id":"new_snapshot_open","union_id":"new_snapshot_union"}`)},
+			},
 		}},
 		TraceID: func() string { return "trace-user-identifier-collision" }, TxStarter: pool,
 	})
@@ -359,10 +364,15 @@ func TestFullSyncRejectsDepartmentIdentifiersMatchingDifferentRows(t *testing.T)
 	}
 	service, err := NewSyncService(SyncServiceConfig{
 		Queries: queries,
-		Provider: fakeSyncDirectoryProvider{data: FullSyncData{Departments: []DirectoryDepartment{{
-			ExternalDepartmentID: "reused_department_id", Name: "Conflicting Department",
-			RawProfile: []byte(`{"department_id":"reused_department_id","open_department_id":"stable_open_department_b"}`),
-		}}}},
+		Provider: fakeSyncDirectoryProvider{data: FullSyncData{Departments: []DirectoryDepartment{
+			{
+				ExternalDepartmentID: "reused_department_id", Name: "Conflicting Department",
+				RawProfile: []byte(`{"department_id":"reused_department_id","open_department_id":"stable_open_department_b"}`),
+			},
+			// Keep the snapshot size stable so the destructive-shrink guard does not mask
+			// the provider-identifier collision this test exercises.
+			{ExternalDepartmentID: "new_snapshot_department", Name: "Snapshot Department", RawProfile: []byte(`{"department_id":"new_snapshot_department","open_department_id":"new_snapshot_open_department"}`)},
+		}}},
 		TraceID: func() string { return "trace-department-identifier-collision" }, TxStarter: pool,
 	})
 	if err != nil {
@@ -474,10 +484,15 @@ func TestFullSyncRollsBackWhenUnionIDMatchesMultipleBindings(t *testing.T) {
 	}
 	service, err := NewSyncService(SyncServiceConfig{
 		Queries: queries,
-		Provider: fakeSyncDirectoryProvider{data: FullSyncData{Users: []DirectoryUser{{
-			ExternalUserID: "new_provider_user", ExternalUnionID: "shared_union", Name: "Ambiguous User", Status: "active",
-			RawProfile: []byte(`{"user_id":"new_provider_user","union_id":"shared_union"}`),
-		}}}},
+		Provider: fakeSyncDirectoryProvider{data: FullSyncData{Users: []DirectoryUser{
+			{
+				ExternalUserID: "new_provider_user", ExternalUnionID: "shared_union", Name: "Ambiguous User", Status: "active",
+				RawProfile: []byte(`{"user_id":"new_provider_user","union_id":"shared_union"}`),
+			},
+			// Keep the snapshot size stable so the destructive-shrink guard does not mask
+			// the ambiguous union binding this test exercises.
+			{ExternalUserID: "snapshot_padding_user", Name: "Snapshot Padding", Status: "active", RawProfile: []byte(`{"user_id":"snapshot_padding_user"}`)},
+		}}},
 		TraceID: func() string { return "trace-binding-union-collision" }, TxStarter: pool,
 	})
 	if err != nil {
@@ -599,7 +614,7 @@ func newAtomicSyncTestPool(ctx context.Context, t *testing.T) *pgxpool.Pool {
 	return newSyncTestPool(ctx, t)
 }
 
-func TestFullSyncArchivesMissingManagedUsers(t *testing.T) {
+func TestFullSyncRejectsEmptySnapshotWithoutMutatingExistingUsers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -680,65 +695,42 @@ func TestFullSyncArchivesMissingManagedUsers(t *testing.T) {
 	}
 	auditWriter := service.audit.(*capturingAuditWriter)
 
-	result, err := service.RunFullSync(ctx, FullSyncInput{
+	_, err = service.RunFullSync(ctx, FullSyncInput{
 		EntityID: entity.ID,
 		SourceID: source.ID,
 		Provider: "feishu",
 	})
-	if err != nil {
-		t.Fatalf("run full sync: %v", err)
+	if !errors.Is(err, ErrSuspiciousFullSnapshot) {
+		t.Fatalf("RunFullSync() error = %v, want ErrSuspiciousFullSnapshot", err)
 	}
 
-	if result.ManagedUsersDeleted != 1 {
-		t.Fatalf("ManagedUsersDeleted = %d, want 1", result.ManagedUsersDeleted)
+	if _, err := queries.GetUserByID(ctx, generated.GetUserByIDParams{EntityID: entity.ID, ID: managedUser.ID}); err != nil {
+		t.Fatalf("managed user changed after rejected snapshot: %v", err)
 	}
-	if result.DirectoryUsersDeleted != 1 {
-		t.Fatalf("DirectoryUsersDeleted = %d, want 1", result.DirectoryUsersDeleted)
-	}
-	if result.DepartmentsDeleted != 1 {
-		t.Fatalf("DepartmentsDeleted = %d, want 1", result.DepartmentsDeleted)
-	}
-	var directoryDepartmentCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM directory_departments WHERE entity_id = $1 AND source_id = $2 AND external_department_id = 'od_removed'`, entity.ID, source.ID).Scan(&directoryDepartmentCount); err != nil {
-		t.Fatalf("count directory departments: %v", err)
-	}
-	if directoryDepartmentCount != 0 {
-		t.Fatalf("directory department count = %d, want 0", directoryDepartmentCount)
-	}
-
-	_, err = queries.GetUserByID(ctx, generated.GetUserByIDParams{
-		EntityID: entity.ID,
-		ID:       managedUser.ID,
-	})
-	if !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("expected active user row to be deleted, got %v", err)
-	}
-
-	archive, err := queries.GetArchivedUserByOriginalID(ctx, generated.GetArchivedUserByOriginalIDParams{
-		EntityID:       entity.ID,
-		OriginalUserID: managedUser.ID,
+	directoryUserAfter, err := queries.GetDirectoryUserByExternalID(ctx, generated.GetDirectoryUserByExternalIDParams{
+		EntityID: entity.ID, SourceID: source.ID, ExternalUserID: directoryUser.ExternalUserID,
 	})
 	if err != nil {
-		t.Fatalf("get archived user: %v", err)
+		t.Fatalf("directory user changed after rejected snapshot: %v", err)
 	}
-	if archive.Username != managedUser.Username {
-		t.Fatalf("archived username = %q, want %q", archive.Username, managedUser.Username)
+	if directoryUserAfter.Status != "active" {
+		t.Fatalf("directory user status = %q, want active", directoryUserAfter.Status)
 	}
-
-	foundArchivedAction := false
+	var archiveCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM archived_users WHERE entity_id = $1`, entity.ID).Scan(&archiveCount); err != nil {
+		t.Fatalf("count archived users: %v", err)
+	}
+	if archiveCount != 0 {
+		t.Fatalf("archive count = %d, want 0", archiveCount)
+	}
+	if len(auditWriter.events) != 2 {
+		// A started + failed sync audit is expected; no archive mutation audit is.
+		t.Fatalf("audit event count = %d, want 2", len(auditWriter.events))
+	}
 	for _, event := range auditWriter.events {
-		if event.ResourceType != "archived_user" {
-			continue
-		}
-		if event.Action == audit.ActionSyncUserDisabled {
-			t.Fatalf("archived_user audit action = %q, do not want disabled action", event.Action)
-		}
 		if event.Action == audit.ActionSyncUserArchived {
-			foundArchivedAction = true
+			t.Fatalf("rejected snapshot emitted archive audit: %#v", event)
 		}
-	}
-	if !foundArchivedAction {
-		t.Fatal("expected archived_user audit event with sync.user.archived action")
 	}
 }
 
@@ -1538,6 +1530,32 @@ type fakeSyncDirectoryProvider struct {
 	err  error
 }
 
+func TestSuspiciousSnapshotShrink(t *testing.T) {
+	tests := []struct {
+		name              string
+		current, incoming int64
+		wantSuspicious    bool
+	}{
+		{name: "empty with current rows", current: 1, incoming: 0, wantSuspicious: true},
+		{name: "large shrink", current: 100, incoming: 40, wantSuspicious: true},
+		{name: "exact half is destructive", current: 100, incoming: 50, wantSuspicious: true},
+		{name: "large ordinary churn remains bounded", current: 100, incoming: 51},
+		{name: "small directory truncation", current: 10, incoming: 4, wantSuspicious: true},
+		{name: "small directory one-row shrink", current: 10, incoming: 9, wantSuspicious: true},
+		{name: "small unchanged snapshot", current: 10, incoming: 10},
+		{name: "growth", current: 10, incoming: 11},
+		{name: "greenfield empty snapshot", current: 0, incoming: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := suspiciousSnapshotShrink("users", test.current, test.incoming)
+			if (got != "") != test.wantSuspicious {
+				t.Fatalf("suspiciousSnapshotShrink() = %q, want suspicious=%v", got, test.wantSuspicious)
+			}
+		})
+	}
+}
+
 type capturingAuditWriter struct {
 	events []audit.Event
 }
@@ -1557,7 +1575,17 @@ func (f fakeSyncDirectoryProvider) IncrementalSync(context.Context, []DirectoryS
 
 func newSyncTestPool(ctx context.Context, t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	if conn := os.Getenv("OPEN_IDB_TEST_DATABASE_URL"); conn != "" {
+		applySyncTestMigrations(ctx, t, conn)
+		pool, err := pgxpool.New(ctx, conn)
+		if err != nil {
+			t.Fatalf("open configured pgx pool: %v", err)
+		}
+		t.Cleanup(pool.Close)
+		return pool
+	}
 
+	testcontainers.SkipIfProviderIsNotHealthy(t)
 	container, err := postgres.Run(ctx,
 		"postgres:16-alpine",
 		postgres.WithDatabase("idbridge"),

@@ -383,7 +383,6 @@ func oidcClientFromRow(row generated.OidcClient) OIDCClientResponse {
 		EntityID:           ulidString(row.EntityID),
 		ApplicationID:      ulidString(row.ApplicationID),
 		ClientID:           row.ClientID,
-		ClientSecret:       textValue(row.ClientSecretHash),
 		RedirectURIs:       row.RedirectUris,
 		AllowedScopes:      row.AllowedScopes,
 		GrantTypes:         row.GrantTypes,

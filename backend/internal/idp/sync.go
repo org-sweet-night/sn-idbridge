@@ -49,10 +49,15 @@ type txStarter interface {
 // entity/source boundary from observing different upstream snapshots.
 var ErrSyncAlreadyRunning = errors.New("sync already running for this identity source")
 
+// ErrSuspiciousFullSnapshot prevents a partial/truncated provider response from
+// being interpreted as authoritative absence and destructively reconciled.
+var ErrSuspiciousFullSnapshot = errors.New("suspicious destructive full-sync snapshot")
+
 const (
-	webhookMaxAttempts int32 = 5
-	webhookClaimBatch        = 200
-	webhookClaimLease        = 5 * time.Minute
+	webhookMaxAttempts      int32 = 5
+	webhookClaimBatch             = 200
+	webhookClaimLease             = 5 * time.Minute
+	fullSyncSmallPopulation       = 20
 )
 
 type FullSyncInput struct {
@@ -290,6 +295,17 @@ func (s *SyncService) runSync(ctx context.Context, input FullSyncInput) (FullSyn
 		_ = s.failJob(ctx, entityID, job.ID, result, err)
 		return result, err
 	}
+	if input.SyncType == SyncModeFull {
+		if err := s.validateFullSnapshot(ctx, entityID, sourceID, len(users), len(departments)); err != nil {
+			_ = s.failJob(ctx, entityID, job.ID, result, err)
+			s.writeAudit(ctx, audit.Event{
+				EntityID: input.EntityID, ActorType: "sync_job", Action: audit.ActionSyncFailed,
+				ResourceType: "sync_job", ResourceID: result.JobID,
+				After: map[string]string{"error": err.Error(), "trace_id": traceID}, TraceID: traceID,
+			})
+			return result, err
+		}
+	}
 
 	var auditEvents []audit.Event
 	if input.SyncType == SyncModeFull {
@@ -325,6 +341,47 @@ func (s *SyncService) runSync(ctx context.Context, input FullSyncInput) (FullSyn
 	})
 
 	return result, nil
+}
+
+func (s *SyncService) validateFullSnapshot(ctx context.Context, entityID, sourceID string, incomingUsers, incomingDepartments int) error {
+	currentUsers, err := s.queries.CountCurrentDirectoryUsersBySource(ctx, generated.CountCurrentDirectoryUsersBySourceParams{
+		EntityID: entityID, SourceID: sourceID,
+	})
+	if err != nil {
+		return fmt.Errorf("count current directory users: %w", err)
+	}
+	currentDepartments, err := s.queries.CountCurrentDirectoryDepartmentsBySource(ctx, generated.CountCurrentDirectoryDepartmentsBySourceParams{
+		EntityID: entityID, SourceID: sourceID,
+	})
+	if err != nil {
+		return fmt.Errorf("count current directory departments: %w", err)
+	}
+	if reason := suspiciousSnapshotShrink("users", currentUsers, int64(incomingUsers)); reason != "" {
+		return fmt.Errorf("%w: %s", ErrSuspiciousFullSnapshot, reason)
+	}
+	if reason := suspiciousSnapshotShrink("departments", currentDepartments, int64(incomingDepartments)); reason != "" {
+		return fmt.Errorf("%w: %s", ErrSuspiciousFullSnapshot, reason)
+	}
+	return nil
+}
+
+func suspiciousSnapshotShrink(kind string, current, incoming int64) string {
+	if current <= 0 {
+		return ""
+	}
+	if incoming <= 0 {
+		return fmt.Sprintf("%s snapshot is empty while %d current rows exist", kind, current)
+	}
+	if incoming >= current {
+		return ""
+	}
+	if current < fullSyncSmallPopulation {
+		return fmt.Sprintf("%s small-population snapshot shrank from %d to %d (any shrink below %d current rows is destructive)", kind, current, incoming, fullSyncSmallPopulation)
+	}
+	if incoming <= current/2 {
+		return fmt.Sprintf("%s snapshot shrank from %d to %d (at least 50%%)", kind, current, incoming)
+	}
+	return ""
 }
 
 // applyPreparedFullSync opens the mutation transaction only after the provider

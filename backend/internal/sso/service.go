@@ -5,8 +5,6 @@ package sso
 import (
 	"context"
 	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/smices/open-idb/internal/clientsecret"
 	"github.com/smices/open-idb/internal/db/generated"
 	"github.com/smices/open-idb/internal/id"
 )
@@ -355,7 +354,7 @@ func (s *Service) ExchangeCode(ctx context.Context, input TokenInput) (TokenResp
 	if err != nil {
 		return TokenResponse{}, err
 	}
-	secretMatches := client.ClientSecretHash.Valid && constantTimeSecretEqual(client.ClientSecretHash.String, input.ClientSecret)
+	secretMatches := client.ClientSecretHash.Valid && clientsecret.Matches(client.ClientSecretHash.String, input.ClientSecret)
 	if client.SecretRequired && (!input.ClientSecretProvided || !secretMatches) {
 		return TokenResponse{}, ErrInvalidClient
 	}
@@ -432,7 +431,7 @@ func (s *Service) ExchangeCode(ctx context.Context, input TokenInput) (TokenResp
 		EntityID:             entityID,
 		CodeHash:             codeHash,
 		ClientSecretProvided: input.ClientSecretProvided,
-		ClientSecret:         pgtype.Text{String: input.ClientSecret, Valid: input.ClientSecretProvided},
+		ClientSecretVerifier: pgtype.Text{String: clientsecret.Hash(input.ClientSecret), Valid: input.ClientSecretProvided},
 		AccessTokenHash:      HashToken(accessToken),
 		AccessTokenExpiresAt: pgtype.Timestamptz{Time: now.Add(s.accessTokenTTL), Valid: true},
 		IDTokenHash:          HashToken(idToken),
@@ -472,7 +471,7 @@ func (s *Service) IssueClientCredentials(ctx context.Context, input ClientCreden
 	if !containsString(client.GrantTypes, "client_credentials") {
 		return TokenResponse{}, fmt.Errorf("client_credentials is not enabled for this client")
 	}
-	if !client.ClientSecretHash.Valid || !constantTimeSecretEqual(client.ClientSecretHash.String, input.ClientSecret) {
+	if !client.ClientSecretHash.Valid || !clientsecret.Matches(client.ClientSecretHash.String, input.ClientSecret) {
 		return TokenResponse{}, ErrInvalidClient
 	}
 	scopes, err := effectiveClientCredentialScopes(input.Scopes, client.AllowedScopes)
@@ -649,12 +648,6 @@ func (s *Service) canRedirectAuthorizationError(ctx context.Context, entityIDVal
 		return false
 	}
 	return containsString(client.RedirectUris, redirectURI)
-}
-
-func constantTimeSecretEqual(expected, provided string) bool {
-	expectedDigest := sha256.Sum256([]byte(expected))
-	providedDigest := sha256.Sum256([]byte(provided))
-	return subtle.ConstantTimeCompare(expectedDigest[:], providedDigest[:]) == 1
 }
 
 func containsString(values []string, target string) bool {

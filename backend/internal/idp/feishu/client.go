@@ -22,17 +22,20 @@ import (
 
 const defaultBaseURL = "https://open.feishu.cn"
 const defaultPageSize = 50
+const defaultMaxPages = 1000
 const defaultHTTPTimeout = 15 * time.Second
 
 type Config struct {
 	AppID     string
 	AppSecret string
 	BaseURL   string
+	MaxPages  int
 }
 
 type Client struct {
 	cfg        Config
 	httpClient *http.Client
+	maxPages   int
 }
 
 type feishuPaginatedResponse struct {
@@ -87,7 +90,14 @@ func NewClient(cfg Config, httpClient *http.Client) (*Client, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultHTTPTimeout}
 	}
-	return &Client{cfg: cfg, httpClient: httpClient}, nil
+	maxPages := cfg.MaxPages
+	if maxPages == 0 {
+		maxPages = defaultMaxPages
+	}
+	if maxPages < 1 {
+		return nil, fmt.Errorf("feishu max pages must be positive")
+	}
+	return &Client{cfg: cfg, httpClient: httpClient, maxPages: maxPages}, nil
 }
 
 func (c *Client) FullSync(ctx context.Context) (idp.FullSyncData, error) {
@@ -228,8 +238,12 @@ func (c *Client) departments(ctx context.Context, token string) ([]idp.Directory
 	rawDepartments := make([]rawDepartment, 0)
 	openIDToDepartmentID := make(map[string]string)
 	pageToken := ""
+	seenPageTokens := map[string]struct{}{"": {}}
 
-	for {
+	for page := 0; ; page++ {
+		if page >= c.maxPages {
+			return nil, fmt.Errorf("feishu departments exceeded maximum page budget %d", c.maxPages)
+		}
 		response, err := c.departmentsPage(ctx, token, pageToken)
 		if err != nil {
 			return nil, err
@@ -264,9 +278,10 @@ func (c *Client) departments(ctx context.Context, token string) ([]idp.Directory
 		if nextPageToken == "" {
 			return nil, fmt.Errorf("feishu departments response missing page_token while has_more=true")
 		}
-		if nextPageToken == pageToken {
+		if _, seen := seenPageTokens[nextPageToken]; seen {
 			return nil, fmt.Errorf("feishu departments response repeated page_token %q", nextPageToken)
 		}
+		seenPageTokens[nextPageToken] = struct{}{}
 		pageToken = nextPageToken
 	}
 
@@ -346,8 +361,12 @@ func (c *Client) users(ctx context.Context, token string, departments []idp.Dire
 func (c *Client) usersByDepartment(ctx context.Context, token string, departmentID string) ([]idp.DirectoryUser, error) {
 	out := make([]idp.DirectoryUser, 0)
 	pageToken := ""
+	seenPageTokens := map[string]struct{}{"": {}}
 
-	for {
+	for page := 0; ; page++ {
+		if page >= c.maxPages {
+			return nil, fmt.Errorf("feishu users for department %q exceeded maximum page budget %d", departmentID, c.maxPages)
+		}
 		response, err := c.usersByDepartmentPage(ctx, token, departmentID, pageToken)
 		if err != nil {
 			return nil, err
@@ -404,9 +423,10 @@ func (c *Client) usersByDepartment(ctx context.Context, token string, department
 		if nextPageToken == "" {
 			return nil, fmt.Errorf("feishu users response missing page_token while has_more=true")
 		}
-		if nextPageToken == pageToken {
+		if _, seen := seenPageTokens[nextPageToken]; seen {
 			return nil, fmt.Errorf("feishu users response repeated page_token %q", nextPageToken)
 		}
+		seenPageTokens[nextPageToken] = struct{}{}
 		pageToken = nextPageToken
 	}
 

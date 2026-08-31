@@ -5,6 +5,7 @@ package feishu
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -616,6 +617,96 @@ func TestUsersRejectRepeatedPaginationToken(t *testing.T) {
 	}
 	if requests != 2 {
 		t.Fatalf("user page requests = %d, want 2 before stopping", requests)
+	}
+}
+
+func TestDepartmentsRejectPaginationTokenCycle(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		next := map[string]string{"": "A", "A": "B", "B": "A"}[r.URL.Query().Get("page_token")]
+		writeJSON(t, w, map[string]interface{}{
+			"code": 0, "data": map[string]interface{}{"has_more": true, "next_page_token": next, "items": []interface{}{}},
+		})
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{AppID: "app-id", AppSecret: "secret", BaseURL: server.URL}, server.Client())
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	_, err = client.departments(context.Background(), "tenant-token")
+	if err == nil || !strings.Contains(err.Error(), "repeated page_token") {
+		t.Fatalf("departments error = %v, want cycle rejection", err)
+	}
+	if requests != 3 {
+		t.Fatalf("department page requests = %d, want 3", requests)
+	}
+}
+
+func TestUsersRejectPaginationTokenCycle(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		next := map[string]string{"": "A", "A": "B", "B": "A"}[r.URL.Query().Get("page_token")]
+		writeJSON(t, w, map[string]interface{}{
+			"code": 0, "data": map[string]interface{}{"has_more": true, "next_page_token": next, "items": []interface{}{}},
+		})
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{AppID: "app-id", AppSecret: "secret", BaseURL: server.URL}, server.Client())
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	_, err = client.usersByDepartment(context.Background(), "tenant-token", "department")
+	if err == nil || !strings.Contains(err.Error(), "repeated page_token") {
+		t.Fatalf("users error = %v, want cycle rejection", err)
+	}
+	if requests != 3 {
+		t.Fatalf("user page requests = %d, want 3", requests)
+	}
+}
+
+func TestDepartmentsEnforceMaximumPageBudget(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		writeJSON(t, w, map[string]interface{}{
+			"code": 0, "data": map[string]interface{}{"has_more": true, "next_page_token": fmt.Sprintf("page-%d", requests), "items": []interface{}{}},
+		})
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{AppID: "app-id", AppSecret: "secret", BaseURL: server.URL, MaxPages: 2}, server.Client())
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	_, err = client.departments(context.Background(), "tenant-token")
+	if err == nil || !strings.Contains(err.Error(), "maximum page budget 2") {
+		t.Fatalf("departments error = %v, want page-budget rejection", err)
+	}
+	if requests != 2 {
+		t.Fatalf("department page requests = %d, want 2", requests)
+	}
+}
+
+func TestUsersEnforceMaximumPageBudget(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		writeJSON(t, w, map[string]interface{}{
+			"code": 0, "data": map[string]interface{}{"has_more": true, "next_page_token": fmt.Sprintf("page-%d", requests), "items": []interface{}{}},
+		})
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{AppID: "app-id", AppSecret: "secret", BaseURL: server.URL, MaxPages: 2}, server.Client())
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	_, err = client.usersByDepartment(context.Background(), "tenant-token", "department")
+	if err == nil || !strings.Contains(err.Error(), "maximum page budget 2") {
+		t.Fatalf("users error = %v, want page-budget rejection", err)
+	}
+	if requests != 2 {
+		t.Fatalf("user page requests = %d, want 2", requests)
 	}
 }
 

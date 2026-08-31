@@ -4,9 +4,11 @@ package adminapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -72,6 +74,28 @@ func (s *AdminService) ResolveOrganizationTreeEntityID(ctx context.Context, cand
 	return entities[0].ID, nil
 }
 
+// GetDirectorySubject returns one current managed subject without consulting
+// the organization-tree cache. Authorization consumers use this exact lookup
+// so lifecycle offboarding and role removals are visible on the next request.
+// Inactive, deleted, unbound, or directory-inactive subjects are not found.
+func (s *AdminService) GetDirectorySubject(ctx context.Context, entityID, subjectID string) (OrganizationTreeNode, error) {
+	row, err := s.queries.GetActiveDirectoryUserByManagedUserID(ctx, generated.GetActiveDirectoryUserByManagedUserIDParams{
+		EntityID: entityID,
+		ID:       subjectID,
+	})
+	if err != nil {
+		return OrganizationTreeNode{}, err
+	}
+	roles, err := s.queries.ListUserRoles(ctx, generated.ListUserRolesParams{EntityID: entityID, UserID: subjectID})
+	if err != nil {
+		return OrganizationTreeNode{}, err
+	}
+	node := directoryUserTreeNode(row, subjectID)
+	node.Roles = organizationTreeRoleCodes(roles)
+	node.Version = directoryAuthorizationVersion(entityID, subjectID, "active", row, node.Roles)
+	return node, nil
+}
+
 type OrganizationTreeNodeKind string
 
 const (
@@ -95,6 +119,8 @@ type OrganizationTreeNode struct {
 	Email                string                   `json:"email,omitempty"`
 	Phone                string                   `json:"phone,omitempty"`
 	ExternalReferences   map[string]string        `json:"external_references,omitempty"`
+	Roles                []string                 `json:"roles,omitempty"`
+	Version              string                   `json:"version,omitempty"`
 	Status               string                   `json:"status,omitempty"`
 	HasChildren          bool                     `json:"has_children"`
 	UpdatedAt            time.Time                `json:"updated_at,omitempty"`
@@ -433,10 +459,67 @@ func (s *AdminService) boundDirectoryUserTreeNode(ctx context.Context, entityID 
 		return OrganizationTreeNode{}, false, err
 	}
 	node := directoryUserTreeNode(row, binding.UserID)
+	roles, err := s.queries.ListUserRoles(ctx, generated.ListUserRolesParams{
+		EntityID: entityID,
+		UserID:   binding.UserID,
+	})
+	if err != nil {
+		return OrganizationTreeNode{}, false, err
+	}
+	node.Roles = organizationTreeRoleCodes(roles)
 	if lifecycleStatus != "active" {
 		node.Status = lifecycleStatus
 	}
+	node.Version = directoryAuthorizationVersion(entityID, binding.UserID, lifecycleStatus, row, node.Roles)
 	return node, true, nil
+}
+
+// organizationTreeRoleCodes projects only IdBridge's authoritative role
+// assignments. Directory raw_profile fields (including TROBS references) are
+// intentionally not an input to authorization.
+func organizationTreeRoleCodes(roles []generated.Role) []string {
+	if len(roles) == 0 {
+		return nil
+	}
+	codes := make([]string, 0, len(roles))
+	for _, role := range roles {
+		codes = append(codes, role.Code)
+	}
+	sort.Strings(codes)
+	return codes
+}
+
+// directoryAuthorizationVersion is an opaque, state-derived revision for IAM
+// membership proofs. It excludes volatile sync/display timestamps and includes
+// only the active managed lifecycle, selected binding target, directory state,
+// and the canonical authoritative role set.
+func directoryAuthorizationVersion(entityID, subjectID, lifecycleStatus string, row generated.DirectoryUser, roles []string) string {
+	canonicalRoles := append([]string(nil), roles...)
+	sort.Strings(canonicalRoles)
+	payload, err := json.Marshal(struct {
+		Schema          string   `json:"schema"`
+		EntityID        string   `json:"entity_id"`
+		SubjectID       string   `json:"subject_id"`
+		LifecycleStatus string   `json:"lifecycle_status"`
+		SourceID        string   `json:"binding_source_id"`
+		DirectoryUserID string   `json:"binding_directory_user_id"`
+		DirectoryStatus string   `json:"directory_status"`
+		Roles           []string `json:"roles"`
+	}{
+		Schema:          "idbridge-directory-authorization/v1",
+		EntityID:        entityID,
+		SubjectID:       subjectID,
+		LifecycleStatus: lifecycleStatus,
+		SourceID:        row.SourceID,
+		DirectoryUserID: row.ID,
+		DirectoryStatus: row.Status,
+		Roles:           canonicalRoles,
+	})
+	if err != nil {
+		panic("marshal directory authorization version: " + err.Error())
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("sha256:%x", digest)
 }
 
 // directoryUserExternalReferences projects only a small, opaque, string-only
