@@ -224,16 +224,11 @@ func (s *Scheduler) executeJob(ctx context.Context, req syncRequest) {
 		return err
 	}
 	var (
-		err     error
-		release func()
+		err error
 	)
 	if s.limiter != nil {
-		release, err = s.limiter.acquire(ctx)
-		if err == nil {
-			defer release()
-		}
-	}
-	if err == nil {
+		err = s.limiter.do(ctx, run)
+	} else {
 		err = run(ctx)
 	}
 

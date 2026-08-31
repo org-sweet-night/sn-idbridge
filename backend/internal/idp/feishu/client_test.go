@@ -710,6 +710,42 @@ func TestUsersEnforceMaximumPageBudget(t *testing.T) {
 	}
 }
 
+func TestFullSyncEnforcesGlobalRowBudgetAcrossDepartmentsAndUsers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]interface{}{"code": 0, "tenant_access_token": "tenant-token"})
+		case "/open-apis/contact/v3/departments/0/children":
+			writeJSON(t, w, map[string]interface{}{
+				"code": 0,
+				"data": map[string]interface{}{
+					"items": []map[string]interface{}{{"department_id": "dep-1", "name": "Department"}},
+				},
+			})
+		case "/open-apis/contact/v3/users/find_by_department":
+			writeJSON(t, w, map[string]interface{}{
+				"code": 0,
+				"data": map[string]interface{}{
+					"items": []map[string]interface{}{{"user_id": "user-1"}},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		AppID: "app-id", AppSecret: "secret", BaseURL: server.URL, MaxSyncRows: 1,
+	}, server.Client())
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if _, err := client.FullSync(context.Background()); err == nil || !strings.Contains(err.Error(), "global row budget 1") {
+		t.Fatalf("FullSync() error = %v, want global row-budget rejection", err)
+	}
+}
+
 func TestMergeDirectoryUserPreservesAllRawProfileFieldsAcrossDepartmentListings(t *testing.T) {
 	existing := idp.DirectoryUser{
 		ExternalUserID: "ou_1",

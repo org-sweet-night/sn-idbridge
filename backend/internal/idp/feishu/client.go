@@ -23,19 +23,48 @@ import (
 const defaultBaseURL = "https://open.feishu.cn"
 const defaultPageSize = 50
 const defaultMaxPages = 1000
+const defaultMaxSyncPages = 10000
+const defaultMaxSyncRows = 100000
 const defaultHTTPTimeout = 15 * time.Second
 
 type Config struct {
-	AppID     string
-	AppSecret string
-	BaseURL   string
-	MaxPages  int
+	AppID        string
+	AppSecret    string
+	BaseURL      string
+	MaxPages     int
+	MaxSyncPages int
+	MaxSyncRows  int
 }
 
 type Client struct {
-	cfg        Config
-	httpClient *http.Client
-	maxPages   int
+	cfg          Config
+	httpClient   *http.Client
+	maxPages     int
+	maxSyncPages int
+	maxSyncRows  int
+}
+
+type syncBudget struct {
+	maxPages int
+	maxRows  int
+	pages    int
+	rowCount int
+}
+
+func (b *syncBudget) page(kind string) error {
+	if b.pages >= b.maxPages {
+		return fmt.Errorf("feishu full sync exceeded global page budget %d while reading %s", b.maxPages, kind)
+	}
+	b.pages++
+	return nil
+}
+
+func (b *syncBudget) addRows(kind string, count int) error {
+	if count < 0 || b.rowCount > b.maxRows-count {
+		return fmt.Errorf("feishu full sync exceeded global row budget %d while reading %s", b.maxRows, kind)
+	}
+	b.rowCount += count
+	return nil
 }
 
 type feishuPaginatedResponse struct {
@@ -97,7 +126,24 @@ func NewClient(cfg Config, httpClient *http.Client) (*Client, error) {
 	if maxPages < 1 {
 		return nil, fmt.Errorf("feishu max pages must be positive")
 	}
-	return &Client{cfg: cfg, httpClient: httpClient, maxPages: maxPages}, nil
+	maxSyncPages := cfg.MaxSyncPages
+	if maxSyncPages == 0 {
+		maxSyncPages = defaultMaxSyncPages
+	}
+	if maxSyncPages < 1 {
+		return nil, fmt.Errorf("feishu global max sync pages must be positive")
+	}
+	maxSyncRows := cfg.MaxSyncRows
+	if maxSyncRows == 0 {
+		maxSyncRows = defaultMaxSyncRows
+	}
+	if maxSyncRows < 1 {
+		return nil, fmt.Errorf("feishu global max sync rows must be positive")
+	}
+	return &Client{
+		cfg: cfg, httpClient: httpClient, maxPages: maxPages,
+		maxSyncPages: maxSyncPages, maxSyncRows: maxSyncRows,
+	}, nil
 }
 
 func (c *Client) FullSync(ctx context.Context) (idp.FullSyncData, error) {
@@ -105,11 +151,12 @@ func (c *Client) FullSync(ctx context.Context) (idp.FullSyncData, error) {
 	if err != nil {
 		return idp.FullSyncData{}, err
 	}
-	departments, err := c.departments(ctx, token)
+	budget := &syncBudget{maxPages: c.maxSyncPages, maxRows: c.maxSyncRows}
+	departments, err := c.departments(ctx, token, budget)
 	if err != nil {
 		return idp.FullSyncData{}, err
 	}
-	users, err := c.users(ctx, token, departments)
+	users, err := c.users(ctx, token, departments, budget)
 	if err != nil {
 		return idp.FullSyncData{}, err
 	}
@@ -228,7 +275,11 @@ func (c *Client) entityAccessToken(ctx context.Context) (string, error) {
 	return response.TenantAccessToken, nil
 }
 
-func (c *Client) departments(ctx context.Context, token string) ([]idp.DirectoryDepartment, error) {
+func (c *Client) departments(ctx context.Context, token string, budgets ...*syncBudget) ([]idp.DirectoryDepartment, error) {
+	budget := &syncBudget{maxPages: c.maxSyncPages, maxRows: c.maxSyncRows}
+	if len(budgets) > 0 && budgets[0] != nil {
+		budget = budgets[0]
+	}
 	type rawDepartment struct {
 		ExternalID string
 		ParentID   string
@@ -244,11 +295,17 @@ func (c *Client) departments(ctx context.Context, token string) ([]idp.Directory
 		if page >= c.maxPages {
 			return nil, fmt.Errorf("feishu departments exceeded maximum page budget %d", c.maxPages)
 		}
+		if err := budget.page("departments"); err != nil {
+			return nil, err
+		}
 		response, err := c.departmentsPage(ctx, token, pageToken)
 		if err != nil {
 			return nil, err
 		}
 
+		if err := budget.addRows("departments", len(response.Data.Items)); err != nil {
+			return nil, err
+		}
 		for _, raw := range response.Data.Items {
 			var item struct {
 				DepartmentID     string `json:"department_id"`
@@ -319,7 +376,7 @@ func (c *Client) departmentsPage(ctx context.Context, token string, pageToken st
 	return response, nil
 }
 
-func (c *Client) users(ctx context.Context, token string, departments []idp.DirectoryDepartment) ([]idp.DirectoryUser, error) {
+func (c *Client) users(ctx context.Context, token string, departments []idp.DirectoryDepartment, budget *syncBudget) ([]idp.DirectoryUser, error) {
 	departmentIDs := []string{"0"}
 	seenDepartments := map[string]struct{}{"0": {}}
 	for _, department := range departments {
@@ -337,7 +394,7 @@ func (c *Client) users(ctx context.Context, token string, departments []idp.Dire
 	out := make([]idp.DirectoryUser, 0)
 	userIndexes := make(map[string]int)
 	for _, departmentID := range departmentIDs {
-		users, err := c.usersByDepartment(ctx, token, departmentID)
+		users, err := c.usersByDepartment(ctx, token, departmentID, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -358,7 +415,11 @@ func (c *Client) users(ctx context.Context, token string, departments []idp.Dire
 	return out, nil
 }
 
-func (c *Client) usersByDepartment(ctx context.Context, token string, departmentID string) ([]idp.DirectoryUser, error) {
+func (c *Client) usersByDepartment(ctx context.Context, token string, departmentID string, budgets ...*syncBudget) ([]idp.DirectoryUser, error) {
+	budget := &syncBudget{maxPages: c.maxSyncPages, maxRows: c.maxSyncRows}
+	if len(budgets) > 0 && budgets[0] != nil {
+		budget = budgets[0]
+	}
 	out := make([]idp.DirectoryUser, 0)
 	pageToken := ""
 	seenPageTokens := map[string]struct{}{"": {}}
@@ -367,11 +428,17 @@ func (c *Client) usersByDepartment(ctx context.Context, token string, department
 		if page >= c.maxPages {
 			return nil, fmt.Errorf("feishu users for department %q exceeded maximum page budget %d", departmentID, c.maxPages)
 		}
+		if err := budget.page("users"); err != nil {
+			return nil, err
+		}
 		response, err := c.usersByDepartmentPage(ctx, token, departmentID, pageToken)
 		if err != nil {
 			return nil, err
 		}
 
+		if err := budget.addRows("users", len(response.Data.Items)); err != nil {
+			return nil, err
+		}
 		for _, raw := range response.Data.Items {
 			var item struct {
 				UserID     string          `json:"user_id"`
