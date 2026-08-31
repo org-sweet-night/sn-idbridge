@@ -137,6 +137,69 @@ func TestTriggerFullSyncReturnsServiceError(t *testing.T) {
 	}
 }
 
+func TestTriggerFullSyncReturnsSnapshotConfirmationEvidence(t *testing.T) {
+	fingerprint := "sha256:" + strings.Repeat("a", 64)
+	router := newTestRouter(&fakeSyncService{
+		result: idp.FullSyncResult{SnapshotFingerprint: fingerprint},
+		err: &idp.SuspiciousFullSnapshotError{
+			SnapshotFingerprint: fingerprint,
+			CurrentUsers:        10,
+			CurrentDepartments:  3,
+			IncomingUsers:       0,
+			IncomingDepartments: 1,
+			Reason:              "users snapshot is empty while 10 current rows exist",
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/sapi/identity-sources/source-1/sync/full", nil)
+	req.Header.Set("X-IDB-Entity-ID", "entity-1")
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+	var response map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["error"] != "destructive_snapshot_confirmation_required" {
+		t.Fatalf("error = %#v", response["error"])
+	}
+	if response["snapshot_fingerprint"] != fingerprint {
+		t.Fatalf("snapshot fingerprint = %#v, want %q", response["snapshot_fingerprint"], fingerprint)
+	}
+	if response["current_users"] != float64(10) || response["current_departments"] != float64(3) {
+		t.Fatalf("current counts = %#v", response)
+	}
+}
+
+func TestTriggerFullSyncRejectsCrossEntitySnapshotConfirmation(t *testing.T) {
+	fingerprint := "sha256:" + strings.Repeat("b", 64)
+	service := &fakeSyncService{result: idp.FullSyncResult{SnapshotFingerprint: fingerprint}}
+	router := newTestRouter(service)
+	req := httptest.NewRequest(http.MethodPost, "/sapi/identity-sources/source-1/sync/full", strings.NewReader(`{
+		"destructive_snapshot_confirmation": {
+			"snapshot_fingerprint": "`+fingerprint+`",
+			"current_users": 10,
+			"current_departments": 3
+		}
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-IDB-Entity-ID", "entity-2")
+	req.AddCookie(testSessionCookie()) // session is scoped to entity-1
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+	if service.runIncrementalCalls != 0 {
+		t.Fatalf("unexpected incremental call count = %d", service.runIncrementalCalls)
+	}
+}
+
 func TestTriggerFullSyncReturnsConflictWhenSyncIsAlreadyRunning(t *testing.T) {
 	router := newTestRouter(&fakeSyncService{err: idp.ErrSyncAlreadyRunning})
 	req := httptest.NewRequest(http.MethodPost, "/sapi/identity-sources/source-1/sync/full", nil)

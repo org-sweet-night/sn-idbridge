@@ -4,9 +4,11 @@ package idp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -53,6 +55,31 @@ var ErrSyncAlreadyRunning = errors.New("sync already running for this identity s
 // being interpreted as authoritative absence and destructively reconciled.
 var ErrSuspiciousFullSnapshot = errors.New("suspicious destructive full-sync snapshot")
 
+// SuspiciousFullSnapshotError carries the non-sensitive evidence an operator
+// needs to review and explicitly approve a potentially truncated snapshot.
+// It unwraps ErrSuspiciousFullSnapshot so callers can retain the stable error
+// classification while exposing the fingerprint and row counts separately.
+type SuspiciousFullSnapshotError struct {
+	SnapshotFingerprint string
+	CurrentUsers        int64
+	CurrentDepartments  int64
+	IncomingUsers       int64
+	IncomingDepartments int64
+	Reason              string
+}
+
+func (e *SuspiciousFullSnapshotError) Error() string {
+	if e == nil {
+		return ErrSuspiciousFullSnapshot.Error()
+	}
+	if e.Reason == "" {
+		return ErrSuspiciousFullSnapshot.Error()
+	}
+	return fmt.Sprintf("%s: %s", ErrSuspiciousFullSnapshot, e.Reason)
+}
+
+func (e *SuspiciousFullSnapshotError) Unwrap() error { return ErrSuspiciousFullSnapshot }
+
 const (
 	webhookMaxAttempts      int32 = 5
 	webhookClaimBatch             = 200
@@ -61,15 +88,17 @@ const (
 )
 
 type FullSyncInput struct {
-	EntityID           string
-	SourceID           string
-	Provider           string
-	SyncType           SyncMode
-	RecoveryClaimToken string
+	EntityID                string
+	SourceID                string
+	Provider                string
+	SyncType                SyncMode
+	RecoveryClaimToken      string
+	DestructiveConfirmation *DestructiveSnapshotConfirmation
 }
 
 type FullSyncResult struct {
 	JobID                 string `json:"job_id"`
+	SnapshotFingerprint   string `json:"snapshot_fingerprint,omitempty"`
 	DepartmentsUpserted   int    `json:"departments_upserted"`
 	DepartmentsDeleted    int    `json:"departments_deleted"`
 	UsersUpserted         int    `json:"users_upserted"`
@@ -296,15 +325,7 @@ func (s *SyncService) runSync(ctx context.Context, input FullSyncInput) (FullSyn
 		return result, err
 	}
 	if input.SyncType == SyncModeFull {
-		if err := s.validateFullSnapshot(ctx, entityID, sourceID, len(users), len(departments)); err != nil {
-			_ = s.failJob(ctx, entityID, job.ID, result, err)
-			s.writeAudit(ctx, audit.Event{
-				EntityID: input.EntityID, ActorType: "sync_job", Action: audit.ActionSyncFailed,
-				ResourceType: "sync_job", ResourceID: result.JobID,
-				After: map[string]string{"error": err.Error(), "trace_id": traceID}, TraceID: traceID,
-			})
-			return result, err
-		}
+		result.SnapshotFingerprint = fullSyncSnapshotFingerprint(users, departments)
 	}
 
 	var auditEvents []audit.Event
@@ -343,26 +364,52 @@ func (s *SyncService) runSync(ctx context.Context, input FullSyncInput) (FullSyn
 	return result, nil
 }
 
-func (s *SyncService) validateFullSnapshot(ctx context.Context, entityID, sourceID string, incomingUsers, incomingDepartments int) error {
+func (s *SyncService) validateFullSnapshot(ctx context.Context, entityID, sourceID string, incomingUsers, incomingDepartments int, snapshotFingerprint string, confirmation *DestructiveSnapshotConfirmation) (bool, error) {
 	currentUsers, err := s.queries.CountCurrentDirectoryUsersBySource(ctx, generated.CountCurrentDirectoryUsersBySourceParams{
 		EntityID: entityID, SourceID: sourceID,
 	})
 	if err != nil {
-		return fmt.Errorf("count current directory users: %w", err)
+		return false, fmt.Errorf("count current directory users: %w", err)
 	}
 	currentDepartments, err := s.queries.CountCurrentDirectoryDepartmentsBySource(ctx, generated.CountCurrentDirectoryDepartmentsBySourceParams{
 		EntityID: entityID, SourceID: sourceID,
 	})
 	if err != nil {
-		return fmt.Errorf("count current directory departments: %w", err)
+		return false, fmt.Errorf("count current directory departments: %w", err)
 	}
+	reasons := make([]string, 0, 2)
 	if reason := suspiciousSnapshotShrink("users", currentUsers, int64(incomingUsers)); reason != "" {
-		return fmt.Errorf("%w: %s", ErrSuspiciousFullSnapshot, reason)
+		reasons = append(reasons, reason)
 	}
 	if reason := suspiciousSnapshotShrink("departments", currentDepartments, int64(incomingDepartments)); reason != "" {
-		return fmt.Errorf("%w: %s", ErrSuspiciousFullSnapshot, reason)
+		reasons = append(reasons, reason)
 	}
-	return nil
+	if len(reasons) == 0 {
+		return false, nil
+	}
+	snapshotError := func(reason string) error {
+		return &SuspiciousFullSnapshotError{
+			SnapshotFingerprint: snapshotFingerprint,
+			CurrentUsers:        currentUsers,
+			CurrentDepartments:  currentDepartments,
+			IncomingUsers:       int64(incomingUsers),
+			IncomingDepartments: int64(incomingDepartments),
+			Reason:              reason,
+		}
+	}
+	if confirmation == nil {
+		return false, snapshotError(strings.Join(reasons, "; "))
+	}
+	if strings.TrimSpace(confirmation.ConfirmedBy) == "" {
+		return false, snapshotError("destructive confirmation actor is required")
+	}
+	if confirmation.SnapshotFingerprint != snapshotFingerprint || !strings.HasPrefix(snapshotFingerprint, "sha256:") {
+		return false, snapshotError("destructive confirmation does not match the fetched snapshot")
+	}
+	if confirmation.CurrentUsers != currentUsers || confirmation.CurrentDepartments != currentDepartments {
+		return false, snapshotError("destructive confirmation counts do not match current source rows")
+	}
+	return true, nil
 }
 
 func suspiciousSnapshotShrink(kind string, current, incoming int64) string {
@@ -385,8 +432,9 @@ func suspiciousSnapshotShrink(kind string, current, incoming int64) string {
 }
 
 // applyPreparedFullSync opens the mutation transaction only after the provider
-// snapshot has been fetched and validated. The service copy prevents concurrent
-// syncs for other sources from observing transaction-bound queries.
+// snapshot has been fetched. The service copy validates current row counts on
+// the same transaction connection immediately before any mutation, so an
+// operator confirmation cannot authorize a stale source population.
 func (s *SyncService) applyPreparedFullSync(ctx context.Context, input FullSyncInput, entityID, sourceID, jobID, traceID string, departments []DirectoryDepartment, users []DirectoryUser, result FullSyncResult) (FullSyncResult, []audit.Event, error) {
 	if s.txStarter == nil {
 		return result, nil, fmt.Errorf("sync service transaction starter is not configured")
@@ -405,6 +453,40 @@ func (s *SyncService) applyPreparedFullSync(ctx context.Context, input FullSyncI
 	txService := *s
 	txService.queries = s.queries.WithTx(tx)
 	txService.txStarter = nil
+	confirmed, err := txService.validateFullSnapshot(ctx, entityID, sourceID, len(users), len(departments), result.SnapshotFingerprint, input.DestructiveConfirmation)
+	if err != nil {
+		return result, nil, err
+	}
+	var confirmationAudit audit.Event
+	if confirmed {
+		if s.audit == nil {
+			return result, nil, fmt.Errorf("destructive full sync requires a durable audit writer")
+		}
+		confirmationAudit = audit.Event{
+			EntityID:     input.EntityID,
+			ActorUserID:  input.DestructiveConfirmation.ConfirmedBy,
+			ActorType:    "admin",
+			Action:       audit.ActionSyncDestructiveSnapshotConfirmed,
+			ResourceType: "sync_job",
+			ResourceID:   result.JobID,
+			After: map[string]any{
+				"snapshot_fingerprint": result.SnapshotFingerprint,
+				"current_users":        input.DestructiveConfirmation.CurrentUsers,
+				"current_departments":  input.DestructiveConfirmation.CurrentDepartments,
+				"confirmed_by":         input.DestructiveConfirmation.ConfirmedBy,
+			},
+			TraceID: traceID,
+		}
+		// The production audit.Service can share the mutation transaction. A
+		// confirmation row written before commit makes the approval evidence
+		// atomic with the destructive reconciliation; a failed audit insert
+		// therefore rolls the mutation back.
+		if _, ok := s.audit.(*audit.Service); ok {
+			if err := audit.NewService(txService.queries).Write(ctx, confirmationAudit); err != nil {
+				return result, nil, fmt.Errorf("persist destructive sync confirmation: %w", err)
+			}
+		}
+	}
 	result, auditEvents, err := txService.applyPreparedSync(ctx, input, entityID, sourceID, jobID, traceID, departments, users, nil, nil, result, true)
 	if err != nil {
 		return result, auditEvents, err
@@ -413,7 +495,54 @@ func (s *SyncService) applyPreparedFullSync(ctx context.Context, input FullSyncI
 		return result, auditEvents, err
 	}
 	committed = true
+	if confirmed {
+		// Test/dedicated writers cannot participate in pgx transactions. Keep
+		// their observable event behavior, while the concrete production writer
+		// was already persisted atomically above.
+		if _, ok := s.audit.(*audit.Service); !ok {
+			auditEvents = append(auditEvents, confirmationAudit)
+		}
+	}
 	return result, auditEvents, nil
+}
+
+func fullSyncSnapshotFingerprint(users []DirectoryUser, departments []DirectoryDepartment) string {
+	canonicalUsers := append([]DirectoryUser(nil), users...)
+	canonicalDepartments := append([]DirectoryDepartment(nil), departments...)
+	sort.SliceStable(canonicalUsers, func(i, j int) bool {
+		return canonicalUsers[i].ExternalUserID < canonicalUsers[j].ExternalUserID
+	})
+	sort.SliceStable(canonicalDepartments, func(i, j int) bool {
+		return canonicalDepartments[i].ExternalDepartmentID < canonicalDepartments[j].ExternalDepartmentID
+	})
+	hasher := sha256.New()
+	write := func(value []byte) {
+		_, _ = hasher.Write(value)
+	}
+	write([]byte(`{"departments":[`))
+	for index, department := range canonicalDepartments {
+		if index > 0 {
+			write([]byte(","))
+		}
+		payload, err := json.Marshal(department)
+		if err != nil {
+			panic("marshal full-sync department fingerprint: " + err.Error())
+		}
+		write(payload)
+	}
+	write([]byte(`],"users":[`))
+	for index, user := range canonicalUsers {
+		if index > 0 {
+			write([]byte(","))
+		}
+		payload, err := json.Marshal(user)
+		if err != nil {
+			panic("marshal full-sync user fingerprint: " + err.Error())
+		}
+		write(payload)
+	}
+	write([]byte(`]}`))
+	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
 }
 
 // applyPreparedSync writes an already fetched and validated snapshot through

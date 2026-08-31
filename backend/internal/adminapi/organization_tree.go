@@ -335,15 +335,11 @@ func (s *AdminService) listDepartmentTreeChildren(ctx context.Context, entityID 
 	if err != nil {
 		return nil, err
 	}
-	for _, row := range userRows {
-		node, included, err := s.boundDirectoryUserTreeNode(ctx, entityID, row)
-		if err != nil {
-			return nil, err
-		}
-		if included {
-			nodes = append(nodes, node)
-		}
+	userNodes, err := s.boundDirectoryUserTreeNodes(ctx, entityID, userRows)
+	if err != nil {
+		return nil, err
 	}
+	nodes = append(nodes, userNodes...)
 	return nodes, nil
 }
 
@@ -437,41 +433,74 @@ func directoryUserTreeNode(row generated.DirectoryUser, subjectID string) Organi
 // An unbound source user is intentionally not eligible for the OAuth directory
 // projection, and a database failure aborts the response rather than guessing.
 func (s *AdminService) boundDirectoryUserTreeNode(ctx context.Context, entityID string, row generated.DirectoryUser) (OrganizationTreeNode, bool, error) {
-	binding, err := s.queries.GetAccountBindingByDirectoryUserID(ctx, generated.GetAccountBindingByDirectoryUserIDParams{
-		EntityID: entityID, SourceID: row.SourceID, DirectoryUserID: row.ID,
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return OrganizationTreeNode{}, false, nil
-	}
+	nodes, err := s.boundDirectoryUserTreeNodes(ctx, entityID, []generated.DirectoryUser{row})
 	if err != nil {
 		return OrganizationTreeNode{}, false, err
 	}
-	if binding.UserID == "" {
+	if len(nodes) == 0 {
 		return OrganizationTreeNode{}, false, nil
 	}
-	lifecycleStatus, err := s.queries.GetUserLifecycleStatus(ctx, generated.GetUserLifecycleStatusParams{
-		EntityID: entityID, ID: binding.UserID,
+	return nodes[0], true, nil
+}
+
+// boundDirectoryUserTreeNodes resolves all bindings, lifecycle states, and
+// authoritative role codes for one response page in a single database query.
+// The directory list endpoints cap pages at 100 rows; keeping this projection
+// batched prevents a cache miss from turning into hundreds of serial queries.
+func (s *AdminService) boundDirectoryUserTreeNodes(ctx context.Context, entityID string, rows []generated.DirectoryUser) ([]OrganizationTreeNode, error) {
+	if len(rows) == 0 {
+		return []OrganizationTreeNode{}, nil
+	}
+	ids := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		if _, ok := seen[row.ID]; ok {
+			continue
+		}
+		seen[row.ID] = struct{}{}
+		ids = append(ids, row.ID)
+	}
+	projections, err := s.queries.ListBoundDirectoryUserTreeNodes(ctx, generated.ListBoundDirectoryUserTreeNodesParams{
+		EntityID: entityID, DirectoryUserIds: ids,
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return OrganizationTreeNode{}, false, nil
-	}
 	if err != nil {
-		return OrganizationTreeNode{}, false, err
+		return nil, err
 	}
-	node := directoryUserTreeNode(row, binding.UserID)
-	roles, err := s.queries.ListUserRoles(ctx, generated.ListUserRolesParams{
-		EntityID: entityID,
-		UserID:   binding.UserID,
-	})
-	if err != nil {
-		return OrganizationTreeNode{}, false, err
+	type projection struct {
+		userID, lifecycle string
+		roles             map[string]struct{}
 	}
-	node.Roles = organizationTreeRoleCodes(roles)
-	if lifecycleStatus != "active" {
-		node.Status = lifecycleStatus
+	byDirectoryID := make(map[string]*projection, len(projections))
+	for _, item := range projections {
+		current := byDirectoryID[item.ID]
+		if current == nil {
+			current = &projection{userID: item.UserID, lifecycle: item.LifecycleStatus, roles: make(map[string]struct{})}
+			byDirectoryID[item.ID] = current
+		}
+		if item.RoleCode.Valid {
+			current.roles[item.RoleCode.String] = struct{}{}
+		}
 	}
-	node.Version = directoryAuthorizationVersion(entityID, binding.UserID, lifecycleStatus, row, node.Roles)
-	return node, true, nil
+	nodes := make([]OrganizationTreeNode, 0, len(rows))
+	for _, row := range rows {
+		item := byDirectoryID[row.ID]
+		if item == nil || item.userID == "" {
+			continue
+		}
+		roles := make([]string, 0, len(item.roles))
+		for role := range item.roles {
+			roles = append(roles, role)
+		}
+		sort.Strings(roles)
+		node := directoryUserTreeNode(row, item.userID)
+		node.Roles = roles
+		if item.lifecycle != "active" {
+			node.Status = item.lifecycle
+		}
+		node.Version = directoryAuthorizationVersion(entityID, item.userID, item.lifecycle, row, roles)
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
 }
 
 // organizationTreeRoleCodes projects only IdBridge's authoritative role
@@ -571,15 +600,11 @@ func (s *AdminService) listRootDirectoryUsers(ctx context.Context, entityID stri
 		return nil, err
 	}
 	nodes := make([]OrganizationTreeNode, 0, len(userRows))
-	for _, row := range userRows {
-		node, included, err := s.boundDirectoryUserTreeNode(ctx, entityID, row)
-		if err != nil {
-			return nil, err
-		}
-		if included {
-			nodes = append(nodes, node)
-		}
+	boundNodes, err := s.boundDirectoryUserTreeNodes(ctx, entityID, userRows)
+	if err != nil {
+		return nil, err
 	}
+	nodes = append(nodes, boundNodes...)
 	return nodes, nil
 }
 
@@ -612,15 +637,11 @@ func (s *AdminService) SearchOrganizationTree(ctx context.Context, entityID, que
 	for _, row := range deptRows {
 		nodes = append(nodes, s.departmentTreeNode(ctx, row))
 	}
-	for _, row := range userRows {
-		node, included, err := s.boundDirectoryUserTreeNode(ctx, entityID, row)
-		if err != nil {
-			return OrganizationTreeSearchResponse{}, err
-		}
-		if included {
-			nodes = append(nodes, node)
-		}
+	boundNodes, err := s.boundDirectoryUserTreeNodes(ctx, entityID, userRows)
+	if err != nil {
+		return OrganizationTreeSearchResponse{}, err
 	}
+	nodes = append(nodes, boundNodes...)
 	return OrganizationTreeSearchResponse{
 		Items:  nodes,
 		Total:  int64(len(nodes)),

@@ -74,13 +74,21 @@ mutation.
 
 ## Destructive snapshot protection
 
-Full sync fails closed before its mutation transaction when an existing source
-has a zero-row user or department snapshot. It also rejects any shrink when a
-source has fewer than 20 current rows, and a shrink of at least 50 percent for
-larger populations. There is no environment-variable or request-body bypass. Legitimate
-offboarding should arrive as confirmed incremental deletes; an exceptional
-large reorganization requires reviewed source evidence and a code/config
-change with tests, never an ad-hoc runtime flag.
+Full sync fails closed before any data mutation when an existing source has a
+zero-row user or department snapshot. It also rejects any shrink when a source
+has fewer than 20 current rows, and a shrink of at least 50 percent for larger
+populations. A rejected run returns the fetched snapshot fingerprint in the
+result/error path only after the provider response has been fully validated.
+An operator may explicitly approve an exceptional shrink through the
+authenticated admin full-sync endpoint by sending the exact
+`sha256:<64 lowercase hex>` fingerprint and the two current-row counts in
+`destructive_snapshot_confirmation`. IdBridge rechecks those counts in the
+mutation transaction, requires the authenticated admin subject, and records a
+redacted confirmation audit event; a stale fingerprint/count or missing admin
+identity remains fail-closed. There is no environment-variable bypass.
+Legitimate offboarding should arrive as confirmed incremental deletes; an
+exceptional large reorganization requires reviewed source evidence and an
+authenticated operator approval, never an ad-hoc runtime flag.
 
 On rejection, current directory rows, bindings, managed users, roles, and
 departments remain unchanged. The failed sync job and redacted failure audit
