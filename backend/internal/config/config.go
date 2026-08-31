@@ -15,33 +15,34 @@ import (
 )
 
 type Config struct {
-	HTTPAddr                   string
-	DatabaseURL                string
-	DBPoolMaxConns             int32
-	DBPoolMinConns             int32
-	DBPoolMinConnsSet          bool
-	DBPoolMaxLifetime          time.Duration
-	DBPoolMaxIdleTime          time.Duration
-	DBPoolAcquireTimeout       time.Duration
-	DBBackgroundMaxConcurrency int
-	DefaultLocale              string
-	ShutdownTimeout            time.Duration
-	OIDCIssuer                 string
-	OIDCKeyID                  string
-	OIDCPrivateKeyPEM          string
-	ConfigEncryptionKey        string
-	AccessTokenTTL             time.Duration
-	IDTokenTTL                 time.Duration
-	AuthCodeTTL                time.Duration
-	SessionTTL                 time.Duration
-	RedisEnabled               bool
-	RedisURL                   string
-	WebBaseURL                 string
-	FeishuAppID                string
-	FeishuAppSecret            string
-	FeishuBaseURL              string
-	FeishuRedirectURI          string
-	TrustedProxyCIDRs          []netip.Prefix
+	HTTPAddr                     string
+	DatabaseURL                  string
+	DBPoolMaxConns               int32
+	DBPoolMinConns               int32
+	DBPoolMinConnsSet            bool
+	DBPoolMaxLifetime            time.Duration
+	DBPoolMaxIdleTime            time.Duration
+	DBPoolAcquireTimeout         time.Duration
+	DBBackgroundOperationTimeout time.Duration
+	DBBackgroundMaxConcurrency   int
+	DefaultLocale                string
+	ShutdownTimeout              time.Duration
+	OIDCIssuer                   string
+	OIDCKeyID                    string
+	OIDCPrivateKeyPEM            string
+	ConfigEncryptionKey          string
+	AccessTokenTTL               time.Duration
+	IDTokenTTL                   time.Duration
+	AuthCodeTTL                  time.Duration
+	SessionTTL                   time.Duration
+	RedisEnabled                 bool
+	RedisURL                     string
+	WebBaseURL                   string
+	FeishuAppID                  string
+	FeishuAppSecret              string
+	FeishuBaseURL                string
+	FeishuRedirectURI            string
+	TrustedProxyCIDRs            []netip.Prefix
 }
 
 func Load() (Config, error) {
@@ -66,6 +67,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	dbPoolAcquireTimeout, err := getDuration("DB_POOL_ACQUIRE_TIMEOUT", 2*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	dbBackgroundOperationTimeout, err := getDuration("DB_BACKGROUND_OPERATION_TIMEOUT", 5*time.Minute)
 	if err != nil {
 		return Config{}, err
 	}
@@ -99,33 +104,34 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		HTTPAddr:                   getEnv("IDB_HTTP_ADDR", ":8080"),
-		DatabaseURL:                os.Getenv("DATABASE_URL"),
-		DBPoolMaxConns:             dbPoolMaxConns,
-		DBPoolMinConns:             dbPoolMinConns,
-		DBPoolMinConnsSet:          strings.TrimSpace(os.Getenv("DB_POOL_MIN_CONNS")) != "",
-		DBPoolMaxLifetime:          dbPoolMaxLifetime,
-		DBPoolMaxIdleTime:          dbPoolMaxIdleTime,
-		DBPoolAcquireTimeout:       dbPoolAcquireTimeout,
-		DBBackgroundMaxConcurrency: dbBackgroundMaxConcurrency,
-		DefaultLocale:              getEnv("IDB_DEFAULT_LOCALE", "en-US"),
-		ShutdownTimeout:            shutdownTimeout,
-		OIDCIssuer:                 getEnv("IDB_OIDC_ISSUER", "http://localhost:8080"),
-		OIDCKeyID:                  getEnv("IDB_OIDC_KEY_ID", "dev-key-1"),
-		OIDCPrivateKeyPEM:          os.Getenv("IDB_OIDC_PRIVATE_KEY_PEM"),
-		ConfigEncryptionKey:        strings.TrimSpace(os.Getenv("IDB_CONFIG_ENCRYPTION_KEY")),
-		AccessTokenTTL:             accessTokenTTL,
-		IDTokenTTL:                 idTokenTTL,
-		AuthCodeTTL:                authCodeTTL,
-		SessionTTL:                 sessionTTL,
-		RedisEnabled:               redisEnabled,
-		RedisURL:                   os.Getenv("IDB_REDIS_URL"),
-		WebBaseURL:                 os.Getenv("IDB_WEB_BASE_URL"),
-		FeishuAppID:                os.Getenv("IDB_FEISHU_APP_ID"),
-		FeishuAppSecret:            os.Getenv("IDB_FEISHU_APP_SECRET"),
-		FeishuBaseURL:              getEnv("IDB_FEISHU_BASE_URL", "https://open.feishu.cn"),
-		FeishuRedirectURI:          getEnv("IDB_FEISHU_REDIRECT_URI", "http://localhost:8080/api/auth/feishu/callback"),
-		TrustedProxyCIDRs:          trustedProxyCIDRs,
+		HTTPAddr:                     getEnv("IDB_HTTP_ADDR", ":8080"),
+		DatabaseURL:                  os.Getenv("DATABASE_URL"),
+		DBPoolMaxConns:               dbPoolMaxConns,
+		DBPoolMinConns:               dbPoolMinConns,
+		DBPoolMinConnsSet:            strings.TrimSpace(os.Getenv("DB_POOL_MIN_CONNS")) != "",
+		DBPoolMaxLifetime:            dbPoolMaxLifetime,
+		DBPoolMaxIdleTime:            dbPoolMaxIdleTime,
+		DBPoolAcquireTimeout:         dbPoolAcquireTimeout,
+		DBBackgroundOperationTimeout: dbBackgroundOperationTimeout,
+		DBBackgroundMaxConcurrency:   dbBackgroundMaxConcurrency,
+		DefaultLocale:                getEnv("IDB_DEFAULT_LOCALE", "en-US"),
+		ShutdownTimeout:              shutdownTimeout,
+		OIDCIssuer:                   getEnv("IDB_OIDC_ISSUER", "http://localhost:8080"),
+		OIDCKeyID:                    getEnv("IDB_OIDC_KEY_ID", "dev-key-1"),
+		OIDCPrivateKeyPEM:            os.Getenv("IDB_OIDC_PRIVATE_KEY_PEM"),
+		ConfigEncryptionKey:          strings.TrimSpace(os.Getenv("IDB_CONFIG_ENCRYPTION_KEY")),
+		AccessTokenTTL:               accessTokenTTL,
+		IDTokenTTL:                   idTokenTTL,
+		AuthCodeTTL:                  authCodeTTL,
+		SessionTTL:                   sessionTTL,
+		RedisEnabled:                 redisEnabled,
+		RedisURL:                     os.Getenv("IDB_REDIS_URL"),
+		WebBaseURL:                   os.Getenv("IDB_WEB_BASE_URL"),
+		FeishuAppID:                  os.Getenv("IDB_FEISHU_APP_ID"),
+		FeishuAppSecret:              os.Getenv("IDB_FEISHU_APP_SECRET"),
+		FeishuBaseURL:                getEnv("IDB_FEISHU_BASE_URL", "https://open.feishu.cn"),
+		FeishuRedirectURI:            getEnv("IDB_FEISHU_REDIRECT_URI", "http://localhost:8080/api/auth/feishu/callback"),
+		TrustedProxyCIDRs:            trustedProxyCIDRs,
 	}
 
 	if cfg.DefaultLocale != "en-US" && cfg.DefaultLocale != "zh-CN" {

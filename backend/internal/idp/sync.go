@@ -1490,6 +1490,19 @@ func (s *SyncService) releaseWebhookSyncLease(entityID, sourceID, claimToken str
 	})
 }
 
+const syncCleanupTimeout = 5 * time.Second
+
+// cleanupContext keeps terminal job state writable even when the sync's
+// operation context was canceled by its deadline or by a provider failure.
+// Values are preserved for tracing, but cancellation is detached and bounded
+// so cleanup cannot keep a database connection indefinitely.
+func cleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		return context.WithTimeout(context.Background(), syncCleanupTimeout)
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), syncCleanupTimeout)
+}
+
 func (s *SyncService) finishWebhookJobs(ctx context.Context, entityID string, webhookJobs []generated.SyncJob, result FullSyncResult, cause error) error {
 	if len(webhookJobs) == 0 {
 		return nil
@@ -1512,8 +1525,10 @@ func (s *SyncService) finishWebhookJobs(ctx context.Context, entityID string, we
 }
 
 func (s *SyncService) retryWebhookJob(ctx context.Context, entityID string, job generated.SyncJob, result FullSyncResult, cause error) error {
+	cleanupCtx, cancel := cleanupContext(ctx)
+	defer cancel()
 	delay := webhookRetryDelay(job.AttemptCount)
-	_, err := s.queries.RescheduleWebhookSyncJob(ctx, generated.RescheduleWebhookSyncJobParams{
+	_, err := s.queries.RescheduleWebhookSyncJob(cleanupCtx, generated.RescheduleWebhookSyncJobParams{
 		ErrorMessage: pgtype.Text{String: cause.Error(), Valid: true},
 		Stats:        mustStatsJSON(result),
 		DelaySeconds: int32(delay / time.Second),
@@ -1537,7 +1552,9 @@ func webhookRetryDelay(attempt int32) time.Duration {
 }
 
 func (s *SyncService) finishWebhookJob(ctx context.Context, entityID string, jobID string, result FullSyncResult) error {
-	_, err := s.queries.FinishSyncJob(ctx, generated.FinishSyncJobParams{
+	cleanupCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	_, err := s.queries.FinishSyncJob(cleanupCtx, generated.FinishSyncJobParams{
 		EntityID: entityID,
 		ID:       jobID,
 		Stats:    mustStatsJSON(result),
@@ -1546,7 +1563,9 @@ func (s *SyncService) finishWebhookJob(ctx context.Context, entityID string, job
 }
 
 func (s *SyncService) failWebhookJob(ctx context.Context, entityID string, jobID string, result FullSyncResult, cause error) error {
-	_, err := s.queries.FailSyncJob(ctx, generated.FailSyncJobParams{
+	cleanupCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	_, err := s.queries.FailSyncJob(cleanupCtx, generated.FailSyncJobParams{
 		EntityID:     entityID,
 		ID:           jobID,
 		ErrorMessage: pgtype.Text{String: cause.Error(), Valid: true},
@@ -1587,7 +1606,9 @@ func (s *SyncService) writeAudit(ctx context.Context, event audit.Event) {
 }
 
 func (s *SyncService) failJob(ctx context.Context, entityID string, jobID string, result FullSyncResult, cause error) error {
-	_, err := s.queries.FailSyncJob(ctx, generated.FailSyncJobParams{
+	cleanupCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	_, err := s.queries.FailSyncJob(cleanupCtx, generated.FailSyncJobParams{
 		EntityID:     entityID,
 		ID:           jobID,
 		ErrorMessage: pgtype.Text{String: cause.Error(), Valid: true},

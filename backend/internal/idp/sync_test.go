@@ -50,6 +50,24 @@ func TestUsernameForDirectoryUser(t *testing.T) {
 	}
 }
 
+func TestCleanupContextDetachesCanceledSync(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+
+	ctx, cancel := cleanupContext(parent)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("cleanup context err = %v, want nil after parent cancellation", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("cleanup context has no deadline")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > syncCleanupTimeout {
+		t.Fatalf("cleanup deadline remaining = %s, want within %s", remaining, syncCleanupTimeout)
+	}
+}
+
 func TestUniqueDirectoryUsersRejectsMissingExternalUserID(t *testing.T) {
 	_, err := uniqueDirectoryUsers([]DirectoryUser{{
 		Name:           "Missing Provider ID",

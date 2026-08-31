@@ -8,20 +8,25 @@ import (
 )
 
 type backgroundLimiter struct {
-	slots   chan struct{}
-	timeout time.Duration
+	slots            chan struct{}
+	acquireTimeout   time.Duration
+	operationTimeout time.Duration
 }
 
-func newBackgroundLimiter(maxConcurrent int, timeout time.Duration) *backgroundLimiter {
+func newBackgroundLimiter(maxConcurrent int, acquireTimeout, operationTimeout time.Duration) *backgroundLimiter {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 2
 	}
-	if timeout <= 0 {
-		timeout = 2 * time.Second
+	if acquireTimeout <= 0 {
+		acquireTimeout = 2 * time.Second
+	}
+	if operationTimeout <= 0 {
+		operationTimeout = 5 * time.Minute
 	}
 	return &backgroundLimiter{
-		slots:   make(chan struct{}, maxConcurrent),
-		timeout: timeout,
+		slots:            make(chan struct{}, maxConcurrent),
+		acquireTimeout:   acquireTimeout,
+		operationTimeout: operationTimeout,
 	}
 }
 
@@ -32,13 +37,13 @@ func (l *backgroundLimiter) do(ctx context.Context, operation func(context.Conte
 	}
 	defer release()
 
-	operationCtx, cancel := context.WithTimeout(ctx, l.timeout)
+	operationCtx, cancel := context.WithTimeout(ctx, l.operationTimeout)
 	defer cancel()
 	return operation(operationCtx)
 }
 
 func (l *backgroundLimiter) acquire(ctx context.Context) (func(), error) {
-	acquireCtx, cancel := context.WithTimeout(ctx, l.timeout)
+	acquireCtx, cancel := context.WithTimeout(ctx, l.acquireTimeout)
 	defer cancel()
 	select {
 	case l.slots <- struct{}{}:

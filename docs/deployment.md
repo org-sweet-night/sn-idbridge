@@ -50,6 +50,7 @@ https://idbridge.example.com
 | `DB_POOL_MAX_CONN_LIFETIME` | 否 | `1h` | 连接最大生命周期，使用 Go duration 格式 |
 | `DB_POOL_MAX_CONN_IDLE_TIME` | 否 | `15m` | 空闲连接最大保留时间，使用 Go duration 格式 |
 | `DB_POOL_ACQUIRE_TIMEOUT` | 建议 | `2s` | 等待池连接的最大时间；超时后请求快速失败 |
+| `DB_BACKGROUND_OPERATION_TIMEOUT` | 建议 | `5m` | 后台同步、审计、cleanup 和 webhook recovery 获得连接后的最大运行时间；独立于连接池等待超时 |
 | `DB_BACKGROUND_MAX_CONCURRENCY` | 建议 | `2` | 同步、审计、cleanup 和 webhook recovery 共享的后台数据库并发预算 |
 | `IDB_HTTP_ADDR` | 是 | `:8080` | 后端监听地址 |
 | `IDB_OIDC_ISSUER` | 是 | `https://idbridge.example.com` | OIDC issuer，必须是用户和外部应用可访问的最终地址 |
@@ -99,6 +100,7 @@ DB_POOL_MIN_CONNS=2
 DB_POOL_MAX_CONN_LIFETIME=1h
 DB_POOL_MAX_CONN_IDLE_TIME=15m
 DB_POOL_ACQUIRE_TIMEOUT=2s
+DB_BACKGROUND_OPERATION_TIMEOUT=5m
 DB_BACKGROUND_MAX_CONCURRENCY=2
 ```
 

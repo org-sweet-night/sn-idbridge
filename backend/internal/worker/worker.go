@@ -30,8 +30,13 @@ type Config struct {
 	// Defaults to 1024 when zero.
 	AuditBufferSize int
 
-	// OperationTimeout bounds waiting for a background database slot and the
-	// operation itself. Defaults to 2 seconds when zero.
+	// AcquireTimeout bounds waiting for a background database slot. Defaults to
+	// 2 seconds when zero so a busy pool fails fast.
+	AcquireTimeout time.Duration
+
+	// OperationTimeout bounds an admitted background operation. Defaults to
+	// 5 minutes when zero; this is deliberately separate from AcquireTimeout
+	// because full directory syncs can legitimately run longer than a pool wait.
 	OperationTimeout time.Duration
 
 	// MaxConcurrentOperations reserves pool capacity for interactive traffic
@@ -53,8 +58,11 @@ func (c *Config) applyDefaults() {
 	if c.AuditBufferSize <= 0 {
 		c.AuditBufferSize = 1024
 	}
+	if c.AcquireTimeout <= 0 {
+		c.AcquireTimeout = 2 * time.Second
+	}
 	if c.OperationTimeout <= 0 {
-		c.OperationTimeout = 2 * time.Second
+		c.OperationTimeout = 5 * time.Minute
 	}
 	if c.MaxConcurrentOperations <= 0 {
 		c.MaxConcurrentOperations = 2
@@ -82,7 +90,7 @@ type Worker struct {
 func New(cfg Config, logger *zap.Logger, runner *SyncRunner, auditSvc AuditWriter, cleanupRunners ...*CleanupRunner) *Worker {
 	cfg.applyDefaults()
 
-	limiter := newBackgroundLimiter(cfg.MaxConcurrentOperations, cfg.OperationTimeout)
+	limiter := newBackgroundLimiter(cfg.MaxConcurrentOperations, cfg.AcquireTimeout, cfg.OperationTimeout)
 	audit := NewAuditProcessor(auditSvc, cfg.AuditBufferSize, logger)
 	scheduler := NewScheduler(runner, audit, cfg.MaxConcurrentSyncs, cfg.MaxConcurrentPerEntity, logger)
 	audit.limiter = limiter
@@ -126,6 +134,7 @@ func (w *Worker) Start(ctx context.Context) {
 		zap.Int("max_concurrent_syncs", w.cfg.MaxConcurrentSyncs),
 		zap.Int("max_per_entity", w.cfg.MaxConcurrentPerEntity),
 		zap.Int("audit_buffer", w.cfg.AuditBufferSize),
+		zap.Duration("acquire_timeout", w.cfg.AcquireTimeout),
 		zap.Duration("operation_timeout", w.cfg.OperationTimeout),
 		zap.Int("max_concurrent_operations", w.cfg.MaxConcurrentOperations),
 	)

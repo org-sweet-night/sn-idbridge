@@ -10,7 +10,7 @@ import (
 )
 
 func TestBackgroundLimiterTimesOutInsteadOfWaitingIndefinitely(t *testing.T) {
-	limiter := newBackgroundLimiter(1, 20*time.Millisecond)
+	limiter := newBackgroundLimiter(1, 20*time.Millisecond, time.Second)
 	release, err := limiter.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -28,7 +28,7 @@ func TestBackgroundLimiterTimesOutInsteadOfWaitingIndefinitely(t *testing.T) {
 }
 
 func TestBackgroundLimiterBoundsAdmittedOperation(t *testing.T) {
-	limiter := newBackgroundLimiter(1, 20*time.Millisecond)
+	limiter := newBackgroundLimiter(1, time.Second, 20*time.Millisecond)
 	started := make(chan struct{})
 	finished := make(chan error, 1)
 

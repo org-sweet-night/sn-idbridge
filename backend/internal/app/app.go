@@ -314,7 +314,8 @@ func New(ctx context.Context, cfg config.Config, logger *zap.Logger) (*App, erro
 		syncRunner.SetOrganizationTreeCacheInvalidator(organizationTreeCache)
 		cleanupRunner := worker.NewCleanupRunner(queries, time.Hour, logger)
 		bgWorker = worker.New(worker.Config{
-			OperationTimeout:        cfg.DBPoolAcquireTimeout,
+			AcquireTimeout:          cfg.DBPoolAcquireTimeout,
+			OperationTimeout:        cfg.DBBackgroundOperationTimeout,
 			MaxConcurrentOperations: cfg.DBBackgroundMaxConcurrency,
 		}, logger, syncRunner, auditService, cleanupRunner)
 		bgWorker.SetWebhookRecoveryStore(queries)
