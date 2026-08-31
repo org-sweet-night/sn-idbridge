@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Alert,
   App as AntApp,
   Button,
   Card,
@@ -604,6 +605,7 @@ function ApplicationsPage() {
   const [saving, setSaving] = useState(false);
   const [selected, setSelected] = useState(null);
   const [viewing, setViewing] = useState(null);
+  const [viewingOneTimeSecret, setViewingOneTimeSecret] = useState(false);
   const [page, setPage] = useState(1);
   const [form] = Form.useForm();
   const { loading, data, reload } = useLoader(() => api.listApplications({
@@ -629,6 +631,7 @@ function ApplicationsPage() {
   };
   const viewApplication = async (row) => {
     try {
+      setViewingOneTimeSecret(false);
       setViewing(await api.getApplication(row.id));
     } catch (error) {
       message.error(errorMessage(error));
@@ -645,7 +648,11 @@ function ApplicationsPage() {
     try {
       const payload = applicationWritePayload(values, Boolean(selected));
       if (selected) await api.updateApplication(selected.id, payload);
-      else await api.createApplication(payload);
+      else {
+        const created = await api.createApplication(payload);
+        setViewing(created);
+        setViewingOneTimeSecret(Boolean(created?.oidc_client?.client_secret));
+      }
       message.success(t('applications.saveSuccess'));
       setOpen(false);
       if (!selected && page !== 1) setPage(1);
@@ -731,7 +738,10 @@ function ApplicationsPage() {
           </Form.Item>
         </Form>
       </Modal>
-      <Modal width={720} title={t('common.view')} open={Boolean(viewing)} footer={<Button onClick={copyViewing}>{t('common.copy')}</Button>} onCancel={() => setViewing(null)}><pre className="json-box">{JSON.stringify(viewing, null, 2)}</pre></Modal>
+      <Modal width={720} title={t('common.view')} open={Boolean(viewing)} footer={<Button onClick={copyViewing}>{t('common.copy')}</Button>} onCancel={() => { setViewing(null); setViewingOneTimeSecret(false); }}>
+        {viewingOneTimeSecret && <Alert type="warning" showIcon message={t('applications.clientSecretOneTime')} />}
+        <pre className="json-box">{JSON.stringify(viewing, null, 2)}</pre>
+      </Modal>
     </div>
   );
 }

@@ -52,6 +52,8 @@ spec:
               value: "15m"
             - name: DB_POOL_ACQUIRE_TIMEOUT
               value: "2s"
+            - name: DB_BACKGROUND_OPERATION_TIMEOUT
+              value: "5m"
             - name: DB_BACKGROUND_MAX_CONCURRENCY
               value: "2"
           readinessProbe:

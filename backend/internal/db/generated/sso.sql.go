@@ -306,7 +306,7 @@ type FinalizeAuthorizationCodeExchangeParams struct {
 	EntityID             string             `json:"entity_id"`
 	CodeHash             string             `json:"code_hash"`
 	ClientSecretProvided bool               `json:"client_secret_provided"`
-	ClientSecret         pgtype.Text        `json:"client_secret"`
+	ClientSecretVerifier pgtype.Text        `json:"client_secret_verifier"`
 	AccessTokenHash      string             `json:"access_token_hash"`
 	AccessTokenExpiresAt pgtype.Timestamptz `json:"access_token_expires_at"`
 	IDTokenHash          string             `json:"id_token_hash"`
@@ -334,7 +334,7 @@ func (q *Queries) FinalizeAuthorizationCodeExchange(ctx context.Context, arg Fin
 		arg.EntityID,
 		arg.CodeHash,
 		arg.ClientSecretProvided,
-		arg.ClientSecret,
+		arg.ClientSecretVerifier,
 		arg.AccessTokenHash,
 		arg.AccessTokenExpiresAt,
 		arg.IDTokenHash,

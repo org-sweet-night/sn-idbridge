@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -142,6 +143,41 @@ func (h Handler) triggerSync(w http.ResponseWriter, r *http.Request, syncType id
 		Provider: "",
 		SyncType: syncType,
 	}
+	if syncType == idp.SyncModeFull {
+		confirmation, err := parseDestructiveSnapshotConfirmation(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_sync_confirmation", err.Error())
+			return
+		}
+		if confirmation != nil {
+			admin, ok := auth.AdminSessionFromContext(r.Context())
+			if !ok {
+				cookie, cookieErr := r.Cookie("idb_admin_session")
+				if cookieErr != nil || strings.TrimSpace(cookie.Value) == "" {
+					writeError(w, http.StatusUnauthorized, "admin_session_required", "idb_admin_session cookie is required")
+					return
+				}
+				admin, cookieErr = auth.ResolveAdminSession(r.Context(), cookie.Value)
+				if cookieErr != nil {
+					writeError(w, http.StatusUnauthorized, "invalid_admin_session", "idb_admin_session cookie is invalid")
+					return
+				}
+			}
+			// The target entity may be supplied by an internal caller header,
+			// but destructive approval is always scoped to the authenticated
+			// admin's tenant. Only a platform admin may cross that boundary.
+			if strings.TrimSpace(admin.Role) != "platform_admin" && strings.TrimSpace(admin.EntityID) != strings.TrimSpace(entityID) {
+				writeError(w, http.StatusForbidden, "invalid_sync_confirmation", "admin session is not authorized for this entity")
+				return
+			}
+			confirmation.ConfirmedBy = strings.TrimSpace(admin.AdminID)
+			if confirmation.ConfirmedBy == "" {
+				writeError(w, http.StatusForbidden, "invalid_sync_confirmation", "admin identity is required for destructive sync confirmation")
+				return
+			}
+			input.DestructiveConfirmation = confirmation
+		}
+	}
 
 	switch syncType {
 	case idp.SyncModeIncremental:
@@ -152,6 +188,19 @@ func (h Handler) triggerSync(w http.ResponseWriter, r *http.Request, syncType id
 	if err != nil {
 		if errors.Is(err, idp.ErrSyncAlreadyRunning) {
 			writeError(w, http.StatusConflict, "sync_in_progress", "a sync is already running for this identity source")
+			return
+		}
+		var snapshotErr *idp.SuspiciousFullSnapshotError
+		if errors.As(err, &snapshotErr) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":                "destructive_snapshot_confirmation_required",
+				"error_description":    "full sync rejected a potentially truncated snapshot; review the snapshot and retry with an authenticated destructive_snapshot_confirmation",
+				"snapshot_fingerprint": snapshotErr.SnapshotFingerprint,
+				"current_users":        snapshotErr.CurrentUsers,
+				"current_departments":  snapshotErr.CurrentDepartments,
+				"incoming_users":       snapshotErr.IncomingUsers,
+				"incoming_departments": snapshotErr.IncomingDepartments,
+			})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "sync_failed", err.Error())
@@ -165,6 +214,27 @@ func (h Handler) triggerSync(w http.ResponseWriter, r *http.Request, syncType id
 		}
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func parseDestructiveSnapshotConfirmation(r *http.Request) (*idp.DestructiveSnapshotConfirmation, error) {
+	if r.Body == nil || r.ContentLength == 0 {
+		return nil, nil
+	}
+	var payload struct {
+		DestructiveSnapshotConfirmation *idp.DestructiveSnapshotConfirmation `json:"destructive_snapshot_confirmation"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 16<<10))
+	if err := decoder.Decode(&payload); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("invalid JSON request body")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("request body must contain one JSON object")
+	}
+	return payload.DestructiveSnapshotConfirmation, nil
 }
 
 func (h Handler) handleFeishuWebhook(w http.ResponseWriter, r *http.Request) {
@@ -343,14 +413,38 @@ func (h Handler) feishuWebhookTarget(w http.ResponseWriter, r *http.Request) (st
 }
 
 func entityIDForRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
-	if entityID := r.Header.Get("X-IDB-Entity-ID"); entityID != "" {
-		return entityID, true
+	headerEntityID := strings.TrimSpace(r.Header.Get("X-IDB-Entity-ID"))
+	if headerEntityID != "" {
+		// Internal callers may supply the target header, but an authenticated
+		// admin session still binds that target to its entity. The outer HTTP
+		// middleware rejects missing/invalid admin cookies; keeping this lookup
+		// optional preserves direct internal-handler tests and service callers.
+		if admin, ok := adminSessionIfPresent(r); ok && strings.TrimSpace(admin.Role) != "platform_admin" && strings.TrimSpace(admin.EntityID) != headerEntityID {
+			writeError(w, http.StatusForbidden, "entity_scope_forbidden", "admin session is not authorized for this entity")
+			return "", false
+		}
+		return headerEntityID, true
 	}
 	session, ok := readSession(w, r)
 	if !ok {
 		return "", false
 	}
 	return session.EntityID, true
+}
+
+func adminSessionIfPresent(r *http.Request) (auth.AdminSession, bool) {
+	if session, ok := auth.AdminSessionFromContext(r.Context()); ok {
+		return session, true
+	}
+	cookie, err := r.Cookie("idb_admin_session")
+	if err != nil || strings.TrimSpace(cookie.Value) == "" {
+		return auth.AdminSession{}, false
+	}
+	session, err := auth.ResolveAdminSession(r.Context(), cookie.Value)
+	if err != nil {
+		return auth.AdminSession{}, false
+	}
+	return session, true
 }
 
 func (h Handler) dashboardSummary(w http.ResponseWriter, r *http.Request) {

@@ -11,6 +11,42 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countCurrentDirectoryDepartmentsBySource = `-- name: CountCurrentDirectoryDepartmentsBySource :one
+SELECT count(*)::bigint
+FROM directory_departments
+WHERE entity_id = $1 AND source_id = $2
+`
+
+type CountCurrentDirectoryDepartmentsBySourceParams struct {
+	EntityID string `json:"entity_id"`
+	SourceID string `json:"source_id"`
+}
+
+func (q *Queries) CountCurrentDirectoryDepartmentsBySource(ctx context.Context, arg CountCurrentDirectoryDepartmentsBySourceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countCurrentDirectoryDepartmentsBySource, arg.EntityID, arg.SourceID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const countCurrentDirectoryUsersBySource = `-- name: CountCurrentDirectoryUsersBySource :one
+SELECT count(*)::bigint
+FROM directory_users
+WHERE entity_id = $1 AND source_id = $2 AND status <> 'deleted'
+`
+
+type CountCurrentDirectoryUsersBySourceParams struct {
+	EntityID string `json:"entity_id"`
+	SourceID string `json:"source_id"`
+}
+
+func (q *Queries) CountCurrentDirectoryUsersBySource(ctx context.Context, arg CountCurrentDirectoryUsersBySourceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countCurrentDirectoryUsersBySource, arg.EntityID, arg.SourceID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const countEntities = `-- name: CountEntities :one
 SELECT count(*) FROM business_entities
 `
@@ -394,6 +430,58 @@ func (q *Queries) GetAccountBindingByProviderUnionID(ctx context.Context, arg Ge
 	return i, err
 }
 
+const getActiveDirectoryUserByManagedUserID = `-- name: GetActiveDirectoryUserByManagedUserID :one
+SELECT du.id, du.entity_id, du.source_id, du.external_user_id, du.external_union_id,
+       du.external_open_id, du.name, du.english_name, du.employee_no,
+       du.job_title, du.email, du.phone, du.avatar_url, du.status,
+       du.raw_profile, du.last_synced_at, du.created_at, du.updated_at
+FROM users managed
+JOIN account_bindings binding
+  ON binding.entity_id = managed.entity_id
+ AND binding.user_id = managed.id
+JOIN directory_users du
+  ON du.entity_id = binding.entity_id
+ AND du.source_id = binding.source_id
+ AND du.id = binding.directory_user_id
+WHERE managed.entity_id = $1
+  AND managed.id = $2
+  AND managed.lifecycle_status = 'active'
+  AND du.status = 'active'
+ORDER BY binding.is_primary DESC, binding.bound_at ASC, du.id ASC
+LIMIT 1
+`
+
+type GetActiveDirectoryUserByManagedUserIDParams struct {
+	EntityID string `json:"entity_id"`
+	ID       string `json:"id"`
+}
+
+func (q *Queries) GetActiveDirectoryUserByManagedUserID(ctx context.Context, arg GetActiveDirectoryUserByManagedUserIDParams) (DirectoryUser, error) {
+	row := q.db.QueryRow(ctx, getActiveDirectoryUserByManagedUserID, arg.EntityID, arg.ID)
+	var i DirectoryUser
+	err := row.Scan(
+		&i.ID,
+		&i.EntityID,
+		&i.SourceID,
+		&i.ExternalUserID,
+		&i.ExternalUnionID,
+		&i.ExternalOpenID,
+		&i.Name,
+		&i.EnglishName,
+		&i.EmployeeNo,
+		&i.JobTitle,
+		&i.Email,
+		&i.Phone,
+		&i.AvatarUrl,
+		&i.Status,
+		&i.RawProfile,
+		&i.LastSyncedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getDirectoryDepartmentByProviderIdentifier = `-- name: GetDirectoryDepartmentByProviderIdentifier :one
 SELECT id, entity_id, source_id, external_department_id, parent_external_department_id, name, raw_profile, last_synced_at, created_at, updated_at
 FROM directory_departments
@@ -761,6 +849,124 @@ func (q *Queries) ListAccountBindingsByProviderUnionID(ctx context.Context, arg 
 			&i.ProviderUnionID,
 			&i.IsPrimary,
 			&i.BoundAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listBoundDirectoryUserTreeNodes = `-- name: ListBoundDirectoryUserTreeNodes :many
+SELECT
+    du.id,
+    du.entity_id,
+    du.source_id,
+    du.external_user_id,
+    du.external_union_id,
+    du.external_open_id,
+    du.name,
+    du.english_name,
+    du.employee_no,
+    du.job_title,
+    du.email,
+    du.phone,
+    du.avatar_url,
+    du.status,
+    du.raw_profile,
+    du.last_synced_at,
+    du.created_at,
+    du.updated_at,
+    binding.user_id,
+    managed.lifecycle_status,
+    assigned_role.code AS role_code
+FROM directory_users du
+JOIN LATERAL (
+    SELECT ab.user_id
+    FROM account_bindings ab
+    WHERE ab.entity_id = du.entity_id
+      AND ab.source_id = du.source_id
+      AND ab.directory_user_id = du.id
+    ORDER BY ab.is_primary DESC, ab.bound_at ASC, ab.id ASC
+    LIMIT 1
+) binding ON TRUE
+JOIN users managed
+  ON managed.entity_id = du.entity_id
+ AND managed.id = binding.user_id
+LEFT JOIN user_roles ur
+  ON ur.entity_id = managed.entity_id
+ AND ur.user_id = managed.id
+LEFT JOIN roles assigned_role
+  ON assigned_role.entity_id = ur.entity_id
+ AND assigned_role.id = ur.role_id
+WHERE du.entity_id = $1
+  AND du.id = ANY($2::text[])
+ORDER BY du.id, assigned_role.code
+`
+
+type ListBoundDirectoryUserTreeNodesParams struct {
+	EntityID         string   `json:"entity_id"`
+	DirectoryUserIds []string `json:"directory_user_ids"`
+}
+
+type ListBoundDirectoryUserTreeNodesRow struct {
+	ID              string             `json:"id"`
+	EntityID        string             `json:"entity_id"`
+	SourceID        string             `json:"source_id"`
+	ExternalUserID  string             `json:"external_user_id"`
+	ExternalUnionID pgtype.Text        `json:"external_union_id"`
+	ExternalOpenID  pgtype.Text        `json:"external_open_id"`
+	Name            string             `json:"name"`
+	EnglishName     string             `json:"english_name"`
+	EmployeeNo      string             `json:"employee_no"`
+	JobTitle        string             `json:"job_title"`
+	Email           pgtype.Text        `json:"email"`
+	Phone           pgtype.Text        `json:"phone"`
+	AvatarUrl       pgtype.Text        `json:"avatar_url"`
+	Status          string             `json:"status"`
+	RawProfile      []byte             `json:"raw_profile"`
+	LastSyncedAt    pgtype.Timestamptz `json:"last_synced_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	UserID          string             `json:"user_id"`
+	LifecycleStatus string             `json:"lifecycle_status"`
+	RoleCode        pgtype.Text        `json:"role_code"`
+}
+
+func (q *Queries) ListBoundDirectoryUserTreeNodes(ctx context.Context, arg ListBoundDirectoryUserTreeNodesParams) ([]ListBoundDirectoryUserTreeNodesRow, error) {
+	rows, err := q.db.Query(ctx, listBoundDirectoryUserTreeNodes, arg.EntityID, arg.DirectoryUserIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListBoundDirectoryUserTreeNodesRow{}
+	for rows.Next() {
+		var i ListBoundDirectoryUserTreeNodesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EntityID,
+			&i.SourceID,
+			&i.ExternalUserID,
+			&i.ExternalUnionID,
+			&i.ExternalOpenID,
+			&i.Name,
+			&i.EnglishName,
+			&i.EmployeeNo,
+			&i.JobTitle,
+			&i.Email,
+			&i.Phone,
+			&i.AvatarUrl,
+			&i.Status,
+			&i.RawProfile,
+			&i.LastSyncedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.UserID,
+			&i.LifecycleStatus,
+			&i.RoleCode,
 		); err != nil {
 			return nil, err
 		}

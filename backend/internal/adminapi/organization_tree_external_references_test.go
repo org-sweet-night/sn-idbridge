@@ -31,6 +31,21 @@ func TestDirectoryUserTreeNodeProjectsOnlyValidOpaqueExternalReferences(t *testi
 	if want := map[string]string{"trobs_user_id": "136", "worker_ref": "worker-42"}; !reflect.DeepEqual(node.ExternalReferences, want) {
 		t.Fatalf("ExternalReferences = %#v, want %#v", node.ExternalReferences, want)
 	}
+	if node.Roles != nil {
+		t.Fatalf("Roles = %#v, want nil before authoritative IdBridge assignments are loaded", node.Roles)
+	}
+}
+
+func TestOrganizationTreeRoleCodesAreAuthoritativeAndDeterministic(t *testing.T) {
+	roles := organizationTreeRoleCodes([]generated.Role{
+		{Code: "isa:pam:requester"},
+		{Code: "employee"},
+		{Code: "isa:pam:approver"},
+	})
+	want := []string{"employee", "isa:pam:approver", "isa:pam:requester"}
+	if !reflect.DeepEqual(roles, want) {
+		t.Fatalf("roles = %#v, want %#v", roles, want)
+	}
 }
 
 func TestDirectoryUserTreeNodeDoesNotProjectMalformedOrUnboundedReferences(t *testing.T) {

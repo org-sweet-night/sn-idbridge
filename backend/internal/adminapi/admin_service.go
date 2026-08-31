@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/smices/open-idb/internal/audit"
+	"github.com/smices/open-idb/internal/clientsecret"
 	"github.com/smices/open-idb/internal/db/generated"
 )
 
@@ -413,7 +414,7 @@ func (s *AdminService) GetApplicationDetail(ctx context.Context, entityID, id st
 
 func (s *AdminService) CreateApplication(ctx context.Context, entityID string, name, appType string) (ApplicationResponse, error) {
 	if s.txStarter != nil {
-		detail, err := s.createApplicationDetail(ctx, entityID, ApplicationWriteInput{Name: name, Type: appType}, false)
+		detail, err := s.createApplicationDetail(ctx, entityID, ApplicationWriteInput{Name: name, Type: appType}, false, nil)
 		return detail.ApplicationResponse, err
 	}
 	row, err := s.queries.CreateApplication(ctx, generated.CreateApplicationParams{
@@ -495,10 +496,25 @@ type internalApplicationConfig struct {
 }
 
 func (s *AdminService) CreateApplicationDetail(ctx context.Context, entityID string, input ApplicationWriteInput) (ApplicationDetailResponse, error) {
-	return s.createApplicationDetail(ctx, entityID, input, true)
+	return s.createApplicationDetail(ctx, entityID, input, true, nil)
 }
 
-func (s *AdminService) createApplicationDetail(ctx context.Context, entityID string, input ApplicationWriteInput, requireComplete bool) (ApplicationDetailResponse, error) {
+// CreateApplicationDetailWithClientSecret is an in-process bootstrap surface
+// for provisioning a confidential OIDC client from a pre-projected secret. It
+// is deliberately absent from the HTTP handler interface: ordinary callers
+// retain generated secrets, while the application, client, role assignment,
+// and redacted audit event remain one transaction in both paths.
+func (s *AdminService) CreateApplicationDetailWithClientSecret(ctx context.Context, entityID string, input ApplicationWriteInput, clientSecret string) (ApplicationDetailResponse, error) {
+	if input.Type != "oidc_client" || input.OIDCClient == nil {
+		return ApplicationDetailResponse{}, &applicationRequestError{message: "an oidc_client application is required"}
+	}
+	if clientSecret != strings.TrimSpace(clientSecret) || len(clientSecret) < 32 || len(clientSecret) > 4096 {
+		return ApplicationDetailResponse{}, &applicationRequestError{message: "client secret must be 32 to 4096 non-whitespace-surrounded characters"}
+	}
+	return s.createApplicationDetail(ctx, entityID, input, true, &clientSecret)
+}
+
+func (s *AdminService) createApplicationDetail(ctx context.Context, entityID string, input ApplicationWriteInput, requireComplete bool, clientSecret *string) (ApplicationDetailResponse, error) {
 	input.Name = strings.TrimSpace(input.Name)
 	input.Type = strings.TrimSpace(input.Type)
 	input.Status = strings.TrimSpace(input.Status)
@@ -549,7 +565,7 @@ func (s *AdminService) createApplicationDetail(ctx context.Context, entityID str
 	}
 	detail := ApplicationDetailResponse{ApplicationResponse: applicationFromRow(row)}
 	if input.OIDCClient != nil {
-		client, err := createOIDCClientForApplication(ctx, txQueries, entityID, row.ID, row.Status, *input.OIDCClient)
+		client, err := createOIDCClientForApplication(ctx, txQueries, entityID, row.ID, row.Status, *input.OIDCClient, clientSecret)
 		if err != nil {
 			return ApplicationDetailResponse{}, err
 		}
@@ -695,7 +711,7 @@ func (s *AdminService) UpdateApplicationDetail(ctx context.Context, entityID, id
 	after := ApplicationDetailResponse{ApplicationResponse: applicationFromRow(row), OIDCClient: before.OIDCClient}
 	if input.OIDCClient != nil {
 		if before.OIDCClient == nil {
-			client, err := createOIDCClientForApplication(ctx, txQueries, entityID, id, row.Status, *input.OIDCClient)
+			client, err := createOIDCClientForApplication(ctx, txQueries, entityID, id, row.Status, *input.OIDCClient, nil)
 			if err != nil {
 				return ApplicationDetailResponse{}, err
 			}
@@ -740,21 +756,27 @@ func applicationDetailFromQueries(ctx context.Context, queries *generated.Querie
 	return detail, nil
 }
 
-func newOIDCClientParams(entityID, applicationID, status string, input ApplicationOIDCClientInput) (generated.CreateOIDCClientParams, error) {
+func newOIDCClientParams(entityID, applicationID, status string, input ApplicationOIDCClientInput, suppliedSecret *string) (generated.CreateOIDCClientParams, string, error) {
 	if err := normalizeOIDCClientCreate(&input); err != nil {
-		return generated.CreateOIDCClientParams{}, err
+		return generated.CreateOIDCClientParams{}, "", err
 	}
 	clientID := strings.TrimSpace(input.ClientID)
 	if clientID == "" {
 		var err error
 		clientID, err = generateOIDCClientID()
 		if err != nil {
-			return generated.CreateOIDCClientParams{}, err
+			return generated.CreateOIDCClientParams{}, "", err
 		}
 	}
-	secret, err := generateRandomSecret(32)
-	if err != nil {
-		return generated.CreateOIDCClientParams{}, err
+	secret := ""
+	if suppliedSecret != nil {
+		secret = *suppliedSecret
+	} else {
+		var err error
+		secret, err = generateRandomSecret(32)
+		if err != nil {
+			return generated.CreateOIDCClientParams{}, "", err
+		}
 	}
 	pkceRequired := *input.PKCERequired
 	provider, appID, appSecret, err := normalizeWorkplaceConfig(
@@ -763,13 +785,13 @@ func newOIDCClientParams(entityID, applicationID, status string, input Applicati
 		stringPointerValue(input.WorkplaceAppSecret),
 	)
 	if err != nil {
-		return generated.CreateOIDCClientParams{}, &applicationRequestError{message: err.Error()}
+		return generated.CreateOIDCClientParams{}, "", &applicationRequestError{message: err.Error()}
 	}
 	return generated.CreateOIDCClientParams{
 		EntityID:           entityID,
 		ApplicationID:      applicationID,
 		ClientID:           clientID,
-		ClientSecretHash:   pgtype.Text{String: secret, Valid: true},
+		ClientSecretHash:   pgtype.Text{String: clientsecret.Hash(secret), Valid: true},
 		RedirectUris:       input.RedirectURIs,
 		AllowedScopes:      input.AllowedScopes,
 		GrantTypes:         input.GrantTypes,
@@ -779,11 +801,11 @@ func newOIDCClientParams(entityID, applicationID, status string, input Applicati
 		WorkplaceAppID:     appID,
 		WorkplaceAppSecret: appSecret,
 		Status:             optionalText(status),
-	}, nil
+	}, secret, nil
 }
 
-func createOIDCClientForApplication(ctx context.Context, queries *generated.Queries, entityID, applicationID, status string, input ApplicationOIDCClientInput) (*OIDCClientResponse, error) {
-	params, err := newOIDCClientParams(entityID, applicationID, status, input)
+func createOIDCClientForApplication(ctx context.Context, queries *generated.Queries, entityID, applicationID, status string, input ApplicationOIDCClientInput, suppliedSecret *string) (*OIDCClientResponse, error) {
+	params, secret, err := newOIDCClientParams(entityID, applicationID, status, input, suppliedSecret)
 	if err != nil {
 		return nil, err
 	}
@@ -797,6 +819,11 @@ func createOIDCClientForApplication(ctx context.Context, queries *generated.Quer
 		return nil, err
 	}
 	client := oidcClientFromRow(row)
+	// Ordinary application creation returns a generated secret exactly once.
+	// Bootstrap supplies its own projected secret and must never receive it back.
+	if suppliedSecret == nil {
+		client.ClientSecret = secret
+	}
 	return &client, nil
 }
 
@@ -1308,7 +1335,7 @@ func (s *AdminService) CreateOIDCClient(ctx context.Context, params generated.Cr
 	if err != nil {
 		return OIDCClientResponse{}, "", err
 	}
-	params.ClientSecretHash = pgtype.Text{String: secret, Valid: true}
+	params.ClientSecretHash = pgtype.Text{String: clientsecret.Hash(secret), Valid: true}
 
 	row, err := s.queries.CreateOIDCClient(ctx, params)
 	if err != nil {
@@ -1364,7 +1391,7 @@ func (s *AdminService) RotateOIDCClientSecret(ctx context.Context, entityID, id 
 	row, err := s.queries.RotateOIDCClientSecret(ctx, generated.RotateOIDCClientSecretParams{
 		EntityID:         entityID,
 		ID:               id,
-		ClientSecretHash: pgtype.Text{String: secret, Valid: true},
+		ClientSecretHash: pgtype.Text{String: clientsecret.Hash(secret), Valid: true},
 	})
 	if err != nil {
 		return OIDCClientResponse{}, "", err

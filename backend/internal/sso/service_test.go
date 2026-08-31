@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/ory/fosite"
+	"github.com/smices/open-idb/internal/clientsecret"
 	"github.com/smices/open-idb/internal/db/generated"
 	"github.com/smices/open-idb/internal/id"
 )
@@ -236,11 +237,17 @@ func TestExchangeCodeAcceptsValidSecretForNewClient(t *testing.T) {
 	store.client.SecretRequired = true
 	service := newExchangeTestService(t, store)
 	input := exchangeTokenInput(store, store.code.EntityID)
-	input.ClientSecret = store.client.ClientSecretHash.String
+	input.ClientSecret = store.clientSecret
 	input.ClientSecretProvided = true
 
 	if _, err := service.ExchangeCode(context.Background(), input); err != nil {
 		t.Fatalf("ExchangeCode() error = %v, want valid client secret to succeed", err)
+	}
+	if !store.lastFinalize.ClientSecretVerifier.Valid || store.lastFinalize.ClientSecretVerifier.String != store.client.ClientSecretHash.String {
+		t.Fatalf("finalize verifier = %#v, want current stored verifier", store.lastFinalize.ClientSecretVerifier)
+	}
+	if store.lastFinalize.ClientSecretVerifier.String == store.clientSecret {
+		t.Fatal("FinalizeAuthorizationCodeExchange() received plaintext client secret")
 	}
 }
 
@@ -278,7 +285,7 @@ func TestIssueClientCredentialsIssuesScopedServiceToken(t *testing.T) {
 	response, err := service.IssueClientCredentials(context.Background(), ClientCredentialsInput{
 		EntityID:             store.client.EntityID,
 		ClientID:             store.client.ClientID,
-		ClientSecret:         store.client.ClientSecretHash.String,
+		ClientSecret:         store.clientSecret,
 		ClientSecretProvided: true,
 		Scopes:               []string{"directory:read"},
 	})
@@ -305,7 +312,7 @@ func TestIssueClientCredentialsRejectsUnapprovedScope(t *testing.T) {
 	_, err := service.IssueClientCredentials(context.Background(), ClientCredentialsInput{
 		EntityID:             store.client.EntityID,
 		ClientID:             store.client.ClientID,
-		ClientSecret:         store.client.ClientSecretHash.String,
+		ClientSecret:         store.clientSecret,
 		ClientSecretProvided: true,
 		Scopes:               []string{"profile"},
 	})
@@ -320,7 +327,9 @@ func TestIssueClientCredentialsRejectsUnapprovedScope(t *testing.T) {
 type exchangeTestStore struct {
 	code             generated.OauthAuthorizationCode
 	client           generated.OidcClient
+	clientSecret     string
 	finalizeCalls    int
+	lastFinalize     generated.FinalizeAuthorizationCodeExchangeParams
 	markUsedCalls    int
 	createTokenCalls int
 	lastToken        generated.CreateOAuthTokenParams
@@ -332,6 +341,7 @@ func newExchangeTestStore() *exchangeTestStore {
 	userID := id.NewULID()
 	verifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 	digest := sha256.Sum256([]byte(verifier))
+	clientSecretValue := "secret-1"
 	return &exchangeTestStore{
 		code: generated.OauthAuthorizationCode{
 			ID:                  id.NewULID(),
@@ -351,11 +361,12 @@ func newExchangeTestStore() *exchangeTestStore {
 			EntityID:         entityID,
 			ApplicationID:    id.NewULID(),
 			ClientID:         "client-1",
-			ClientSecretHash: pgtype.Text{String: "secret-1", Valid: true},
+			ClientSecretHash: pgtype.Text{String: clientsecret.Hash(clientSecretValue), Valid: true},
 			RedirectUris:     []string{"https://app.example.test/callback"},
 			AllowedScopes:    []string{"openid", "profile", "email"},
 			Status:           "active",
 		},
+		clientSecret: clientSecretValue,
 	}
 }
 
@@ -430,8 +441,9 @@ func (s *exchangeTestStore) CreateOAuthToken(_ context.Context, arg generated.Cr
 	s.lastToken = arg
 	return generated.OauthToken{}, nil
 }
-func (s *exchangeTestStore) FinalizeAuthorizationCodeExchange(context.Context, generated.FinalizeAuthorizationCodeExchangeParams) (generated.FinalizeAuthorizationCodeExchangeRow, error) {
+func (s *exchangeTestStore) FinalizeAuthorizationCodeExchange(_ context.Context, arg generated.FinalizeAuthorizationCodeExchangeParams) (generated.FinalizeAuthorizationCodeExchangeRow, error) {
 	s.finalizeCalls++
+	s.lastFinalize = arg
 	return generated.FinalizeAuthorizationCodeExchangeRow{
 		ID:       s.code.ID,
 		EntityID: s.code.EntityID,

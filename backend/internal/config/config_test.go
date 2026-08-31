@@ -48,6 +48,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.DBPoolAcquireTimeout != 2*time.Second {
 		t.Fatalf("DBPoolAcquireTimeout = %s, want %s", cfg.DBPoolAcquireTimeout, 2*time.Second)
 	}
+	if cfg.DBBackgroundOperationTimeout != 5*time.Minute {
+		t.Fatalf("DBBackgroundOperationTimeout = %s, want %s", cfg.DBBackgroundOperationTimeout, 5*time.Minute)
+	}
 	if cfg.DBBackgroundMaxConcurrency != 2 {
 		t.Fatalf("DBBackgroundMaxConcurrency = %d, want 2", cfg.DBBackgroundMaxConcurrency)
 	}
@@ -55,12 +58,13 @@ func TestLoadDefaults(t *testing.T) {
 
 func TestLoadAcceptsDatabasePoolSettings(t *testing.T) {
 	setConfigEnv(t, map[string]string{
-		"DB_POOL_MAX_CONNS":             "15",
-		"DB_POOL_MIN_CONNS":             "2",
-		"DB_POOL_MAX_CONN_LIFETIME":     "45m",
-		"DB_POOL_MAX_CONN_IDLE_TIME":    "10m",
-		"DB_POOL_ACQUIRE_TIMEOUT":       "1500ms",
-		"DB_BACKGROUND_MAX_CONCURRENCY": "3",
+		"DB_POOL_MAX_CONNS":               "15",
+		"DB_POOL_MIN_CONNS":               "2",
+		"DB_POOL_MAX_CONN_LIFETIME":       "45m",
+		"DB_POOL_MAX_CONN_IDLE_TIME":      "10m",
+		"DB_POOL_ACQUIRE_TIMEOUT":         "1500ms",
+		"DB_BACKGROUND_OPERATION_TIMEOUT": "90s",
+		"DB_BACKGROUND_MAX_CONCURRENCY":   "3",
 	})
 
 	cfg, err := Load()
@@ -75,6 +79,9 @@ func TestLoadAcceptsDatabasePoolSettings(t *testing.T) {
 	}
 	if cfg.DBPoolAcquireTimeout != 1500*time.Millisecond {
 		t.Fatalf("DBPoolAcquireTimeout = %s", cfg.DBPoolAcquireTimeout)
+	}
+	if cfg.DBBackgroundOperationTimeout != 90*time.Second {
+		t.Fatalf("DBBackgroundOperationTimeout = %s", cfg.DBBackgroundOperationTimeout)
 	}
 	if cfg.DBBackgroundMaxConcurrency != 3 {
 		t.Fatalf("DBBackgroundMaxConcurrency = %d", cfg.DBBackgroundMaxConcurrency)
@@ -396,6 +403,7 @@ func setConfigEnv(t *testing.T, values map[string]string) {
 		"DB_POOL_MAX_CONN_LIFETIME",
 		"DB_POOL_MAX_CONN_IDLE_TIME",
 		"DB_POOL_ACQUIRE_TIMEOUT",
+		"DB_BACKGROUND_OPERATION_TIMEOUT",
 		"DB_BACKGROUND_MAX_CONCURRENCY",
 	} {
 		t.Setenv(key, "")

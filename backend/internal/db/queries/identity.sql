@@ -257,6 +257,52 @@ SELECT id, entity_id, user_id, source_id, directory_user_id, provider_uid, provi
 FROM account_bindings
 WHERE entity_id = $1 AND source_id = $2 AND directory_user_id = $3;
 
+-- name: ListBoundDirectoryUserTreeNodes :many
+SELECT
+    du.id,
+    du.entity_id,
+    du.source_id,
+    du.external_user_id,
+    du.external_union_id,
+    du.external_open_id,
+    du.name,
+    du.english_name,
+    du.employee_no,
+    du.job_title,
+    du.email,
+    du.phone,
+    du.avatar_url,
+    du.status,
+    du.raw_profile,
+    du.last_synced_at,
+    du.created_at,
+    du.updated_at,
+    binding.user_id,
+    managed.lifecycle_status,
+    assigned_role.code AS role_code
+FROM directory_users du
+JOIN LATERAL (
+    SELECT ab.user_id
+    FROM account_bindings ab
+    WHERE ab.entity_id = du.entity_id
+      AND ab.source_id = du.source_id
+      AND ab.directory_user_id = du.id
+    ORDER BY ab.is_primary DESC, ab.bound_at ASC, ab.id ASC
+    LIMIT 1
+) binding ON TRUE
+JOIN users managed
+  ON managed.entity_id = du.entity_id
+ AND managed.id = binding.user_id
+LEFT JOIN user_roles ur
+  ON ur.entity_id = managed.entity_id
+ AND ur.user_id = managed.id
+LEFT JOIN roles assigned_role
+  ON assigned_role.entity_id = ur.entity_id
+ AND assigned_role.id = ur.role_id
+WHERE du.entity_id = $1
+  AND du.id = ANY(sqlc.arg('directory_user_ids')::text[])
+ORDER BY du.id, assigned_role.code;
+
 -- name: GetManagedUserForDeletedDirectoryUser :one
 SELECT u.id, u.entity_id, u.username, u.display_name, u.english_name, u.employee_no, u.job_title, u.email, u.phone, u.avatar_url, u.lifecycle_status, u.user_type, u.primary_source_id, u.locale, u.created_at, u.updated_at
 FROM users u
@@ -335,6 +381,36 @@ SELECT id, entity_id, username, display_name, english_name, employee_no, job_tit
 FROM users
 WHERE entity_id = $1 AND username = $2
 LIMIT 1;
+
+-- name: GetActiveDirectoryUserByManagedUserID :one
+SELECT du.id, du.entity_id, du.source_id, du.external_user_id, du.external_union_id,
+       du.external_open_id, du.name, du.english_name, du.employee_no,
+       du.job_title, du.email, du.phone, du.avatar_url, du.status,
+       du.raw_profile, du.last_synced_at, du.created_at, du.updated_at
+FROM users managed
+JOIN account_bindings binding
+  ON binding.entity_id = managed.entity_id
+ AND binding.user_id = managed.id
+JOIN directory_users du
+  ON du.entity_id = binding.entity_id
+ AND du.source_id = binding.source_id
+ AND du.id = binding.directory_user_id
+WHERE managed.entity_id = $1
+  AND managed.id = $2
+  AND managed.lifecycle_status = 'active'
+  AND du.status = 'active'
+ORDER BY binding.is_primary DESC, binding.bound_at ASC, du.id ASC
+LIMIT 1;
+
+-- name: CountCurrentDirectoryUsersBySource :one
+SELECT count(*)::bigint
+FROM directory_users
+WHERE entity_id = $1 AND source_id = $2 AND status <> 'deleted';
+
+-- name: CountCurrentDirectoryDepartmentsBySource :one
+SELECT count(*)::bigint
+FROM directory_departments
+WHERE entity_id = $1 AND source_id = $2;
 
 -- name: GetManagedUserByBinding :one
 SELECT u.id, u.entity_id, u.username, u.display_name, u.english_name, u.employee_no, u.job_title, u.email, u.phone, u.avatar_url, u.lifecycle_status, u.user_type, u.primary_source_id, u.locale, u.created_at, u.updated_at

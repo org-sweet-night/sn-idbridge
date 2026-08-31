@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pressly/goose/v3"
 	"github.com/smices/open-idb/internal/audit"
+	"github.com/smices/open-idb/internal/clientsecret"
 	"github.com/smices/open-idb/internal/db/generated"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -183,12 +184,22 @@ func TestApplicationDetailMutationsAreAtomicAndKeepReadableSecretsOutOfAudit(t *
 		t.Fatalf("create response does not contain a readable client secret: %#v", created.OIDCClient)
 	}
 	clientSecret := created.OIDCClient.ClientSecret
+	var storedVerifier string
+	if err := pool.QueryRow(ctx, `SELECT client_secret_hash FROM oidc_clients WHERE entity_id = $1 AND application_id = $2`, entity.ID, created.ID).Scan(&storedVerifier); err != nil {
+		t.Fatalf("read stored client-secret verifier: %v", err)
+	}
+	if storedVerifier == clientSecret || !clientsecret.Matches(storedVerifier, clientSecret) {
+		t.Fatalf("stored client-secret verifier is not one-way: %q", storedVerifier)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE oidc_clients SET client_secret_hash = $1 WHERE entity_id = $2 AND application_id = $3`, clientSecret, entity.ID, created.ID); err == nil {
+		t.Fatal("database accepted a plaintext client secret")
+	}
 	loaded, err := svc.GetApplicationDetail(ctx, entity.ID, created.ID)
 	if err != nil {
 		t.Fatalf("get complete OIDC application: %v", err)
 	}
-	if loaded.OIDCClient == nil || loaded.OIDCClient.ClientSecret != clientSecret {
-		t.Fatalf("detail client secret = %#v, want %q", loaded.OIDCClient, clientSecret)
+	if loaded.OIDCClient == nil || loaded.OIDCClient.ClientSecret != "" {
+		t.Fatalf("detail re-exposed client secret: %#v", loaded.OIDCClient)
 	}
 
 	if _, err := svc.CreateApplicationDetail(ctx, entity.ID, ApplicationWriteInput{
@@ -239,8 +250,8 @@ func TestApplicationDetailMutationsAreAtomicAndKeepReadableSecretsOutOfAudit(t *
 	if updated.OIDCClient == nil || len(updated.OIDCClient.RedirectURIs) != 1 || updated.OIDCClient.RedirectURIs[0] != "https://new.example/callback" {
 		t.Fatalf("updated OIDC callback = %#v", updated.OIDCClient)
 	}
-	if updated.OIDCClient.ClientSecret != clientSecret {
-		t.Fatalf("client secret changed during ordinary edit: got %q want %q", updated.OIDCClient.ClientSecret, clientSecret)
+	if updated.OIDCClient.ClientSecret != "" {
+		t.Fatalf("ordinary edit re-exposed client secret: %q", updated.OIDCClient.ClientSecret)
 	}
 	assertApplicationAuditHasNoSecret(ctx, t, pool, created.ID, clientSecret, "readable-workplace-secret")
 

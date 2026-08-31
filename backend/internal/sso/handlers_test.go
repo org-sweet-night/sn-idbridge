@@ -159,7 +159,7 @@ func TestTokenEndpointIssuesClientCredentials(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(store.client.ClientID, store.client.ClientSecretHash.String)
+	req.SetBasicAuth(store.client.ClientID, store.clientSecret)
 	rec := httptest.NewRecorder()
 
 	router.ServeHTTP(rec, req)
@@ -376,7 +376,7 @@ func TestTokenEndpointAcceptsBasicCredentialsAndInfersEntity(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(body.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(store.client.ClientID, store.client.ClientSecretHash.String)
+	req.SetBasicAuth(store.client.ClientID, store.clientSecret)
 
 	router.ServeHTTP(rec, req)
 

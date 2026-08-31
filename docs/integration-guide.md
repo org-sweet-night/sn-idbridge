@@ -77,7 +77,7 @@ IDB_FEISHU_REDIRECT_URI='https://idbridge.example.com/api/auth/feishu/callback'
 - “组织架构”显示公司、部门树和同步来的员工。
 - “账号管理”显示 IdBridge 内可登录、可授权、可分配角色和应用访问的账号。
 - 通讯录档案和账号对象不是同一个概念。
-- 全量同步按飞书快照收敛：匹配到既有用户时保留 IdBridge ULID，源端缺失的部门和目录用户会被清理；对应受管账号会按既有规则归档并从活动 `users` 中移除。
+- 全量同步按飞书快照收敛：匹配到既有用户时保留 IdBridge ULID，源端缺失的部门和目录用户会被清理；对应受管账号会按既有规则归档并从活动 `users` 中移除。疑似截断的零行/大幅缩减快照会拒绝写入；管理员必须使用本次返回的精确快照指纹和当前行数显式确认，确认会记录脱敏审计事件。
 - 远端快照拉取成功后，本次全量同步的数据库变更与成功状态原子提交；任一写入失败会整体回滚，不会留下半完成快照。
 - 飞书 webhook 先持久化为同步任务；相同身份源下重复的 `event_id` 只保留一条。服务重启或副本切换后，后台 worker 会恢复未完成任务并执行增量同步；临时失败按持久化退避重试，成功后任务状态为 `succeeded`，达到重试上限后为 `failed`。
 
@@ -109,10 +109,12 @@ IDB_FEISHU_REDIRECT_URI='https://idbridge.example.com/api/auth/feishu/callback'
 - `response_type`: `code`
 - PKCE: enabled
 
-应用详情会显示完整配置，并可一次复制为 JSON，内容包括可再次读取的 `client_secret`：
+创建响应会显示一次 `client_secret`；调用方必须当场写入自己的 secret
+manager。IdBridge 之后只保存单向 verifier，应用详情、普通更新、审计和
+后续读取都不会再次返回该 secret：
 
 - 应用基本信息与状态
-- `client_id`、`client_secret`
+- `client_id`，以及仅创建响应中的一次性 `client_secret`
 - 回调 URI、scope、grant type、response type 与 PKCE 配置
 - 已配置的工作台提供方字段
 
@@ -259,9 +261,17 @@ OIDC 应用如果需要做人员选择、部门选择或组织内搜索，管理
 GET /api/directory/organization-tree/root
 GET /api/directory/organization-tree/children?id=<node_id>&kind=company|organization|department
 GET /api/directory/organization-tree/search?q=<keyword>
+GET /api/directory/users/<managed_oidc_subject_id>
 ```
 
-这些接口返回已同步的公司、部门和目录用户节点，用于业务应用内的人员选择和查找。接口不会返回原始飞书档案或外部平台敏感 ID。
+这些接口返回已同步的公司、部门和目录用户节点，用于业务应用内的人员选择和查找。用户节点的 `roles` 数组只投影 IdBridge 中该托管用户的权威角色分配（例如 `isa:pam:requester` 和 `isa:pam:approver`）。外部引用（包括 `trobs_user_id`）只是受限、opaque 的关联元数据，绝不能推导或授予角色；接口不会返回原始飞书档案。
+
+精确用户接口不读取组织树缓存，并返回顶层 `version`。该 opaque
+`sha256:<lowercase-hex>` 值只覆盖托管用户 active lifecycle、当前绑定的
+source/directory-user、目录状态和排序后的 IdBridge 角色集合。IAM 应使用
+`id` 作为 IdBridge subject、使用 `roles` 做当前 membership，并把 `version`
+作为 membership proof revision；不得以 `updated_at` 代替，因为等价同步也会
+推进该显示/同步时间戳。inactive、deleted 或 unbound subject 返回 `404`。
 
 管理员需要先在 `/admin/applications` 的 OIDC 配置中允许 `directory:read`，否则 token 不会获得该 scope，调用目录 API 会返回 `insufficient_scope`。
 
