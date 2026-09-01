@@ -4,12 +4,14 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/smices/open-idb/internal/audit"
 	"github.com/smices/open-idb/internal/db/generated"
 	"github.com/smices/open-idb/internal/idp"
 	"github.com/testcontainers/testcontainers-go"
@@ -237,6 +239,7 @@ func TestFeishuFullSyncMergesExistingUserAndArchivesMissing(t *testing.T) {
 	service, err := idp.NewSyncService(idp.SyncServiceConfig{
 		Queries:   queries,
 		Provider:  provider,
+		Audit:     audit.NewService(queries),
 		TraceID:   func() string { return "trace-merge-sync" },
 		TxStarter: pool,
 	})
@@ -260,13 +263,28 @@ func TestFeishuFullSyncMergesExistingUserAndArchivesMissing(t *testing.T) {
 	assertSingleString(t, ctx, pool, "select provider_uid from account_bindings where entity_id=$1 and source_id=$2", "ou_merge", entity.ID, source.ID)
 
 	provider.data.Users = nil
-	second, err := service.RunFullSync(ctx, idp.FullSyncInput{
+	_, err = service.RunFullSync(ctx, idp.FullSyncInput{
 		EntityID: pgULIDString(entity.ID),
 		SourceID: pgULIDString(source.ID),
 		Provider: "feishu",
 	})
+	var snapshotErr *idp.SuspiciousFullSnapshotError
+	if !errors.As(err, &snapshotErr) {
+		t.Fatalf("run second sync without confirmation: %v, want suspicious snapshot error", err)
+	}
+	second, err := service.RunFullSync(ctx, idp.FullSyncInput{
+		EntityID: pgULIDString(entity.ID),
+		SourceID: pgULIDString(source.ID),
+		Provider: "feishu",
+		DestructiveConfirmation: &idp.DestructiveSnapshotConfirmation{
+			SnapshotFingerprint: snapshotErr.SnapshotFingerprint,
+			CurrentUsers:        snapshotErr.CurrentUsers,
+			CurrentDepartments:  snapshotErr.CurrentDepartments,
+			ConfirmedBy:         pgULIDString(existing.ID),
+		},
+	})
 	if err != nil {
-		t.Fatalf("run second sync: %v", err)
+		t.Fatalf("run confirmed second sync: %v", err)
 	}
 	if second.DirectoryUsersDeleted != 1 || second.ManagedUsersDeleted != 1 {
 		t.Fatalf("second result = %#v", second)
@@ -274,6 +292,7 @@ func TestFeishuFullSyncMergesExistingUserAndArchivesMissing(t *testing.T) {
 	assertSingleString(t, ctx, pool, "select status from directory_users where entity_id=$1 and source_id=$2", "deleted", entity.ID, source.ID)
 	assertSingleInt(t, ctx, pool, "select count(*) from users where entity_id=$1", 0, entity.ID)
 	assertSingleString(t, ctx, pool, "select original_user_id from archived_users where entity_id=$1", existing.ID, entity.ID)
+	assertSingleString(t, ctx, pool, "select action from audit_logs where entity_id=$1 and action=$2 order by created_at desc limit 1", audit.ActionSyncDestructiveSnapshotConfirmed, entity.ID, audit.ActionSyncDestructiveSnapshotConfirmed)
 }
 
 func TestFeishuFullSyncMarksJobFailedOnProviderError(t *testing.T) {
