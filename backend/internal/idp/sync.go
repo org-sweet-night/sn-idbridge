@@ -316,12 +316,30 @@ func (s *SyncService) runSync(ctx context.Context, input FullSyncInput) (FullSyn
 	if err != nil {
 		_ = s.finishWebhookJobs(ctx, entityID, webhookJobs, result, err)
 		_ = s.failJob(ctx, entityID, job.ID, result, err)
+		s.writeAudit(ctx, audit.Event{
+			EntityID:     input.EntityID,
+			ActorType:    "sync_job",
+			Action:       audit.ActionSyncFailed,
+			ResourceType: "sync_job",
+			ResourceID:   result.JobID,
+			After:        map[string]string{"error": err.Error(), "trace_id": traceID},
+			TraceID:      traceID,
+		})
 		return result, err
 	}
 	departments, err := prepareDirectoryDepartments(data.Departments)
 	if err != nil {
 		_ = s.finishWebhookJobs(ctx, entityID, webhookJobs, result, err)
 		_ = s.failJob(ctx, entityID, job.ID, result, err)
+		s.writeAudit(ctx, audit.Event{
+			EntityID:     input.EntityID,
+			ActorType:    "sync_job",
+			Action:       audit.ActionSyncFailed,
+			ResourceType: "sync_job",
+			ResourceID:   result.JobID,
+			After:        map[string]string{"error": err.Error(), "trace_id": traceID},
+			TraceID:      traceID,
+		})
 		return result, err
 	}
 	if input.SyncType == SyncModeFull {
@@ -342,6 +360,15 @@ func (s *SyncService) runSync(ctx context.Context, input FullSyncInput) (FullSyn
 		}
 		_ = s.finishWebhookJobs(ctx, entityID, webhookJobs, result, err)
 		_ = s.failJob(ctx, entityID, job.ID, result, err)
+		s.writeAudit(ctx, audit.Event{
+			EntityID:     input.EntityID,
+			ActorType:    "sync_job",
+			Action:       audit.ActionSyncFailed,
+			ResourceType: "sync_job",
+			ResourceID:   result.JobID,
+			After:        map[string]string{"error": err.Error(), "trace_id": traceID},
+			TraceID:      traceID,
+		})
 		return result, err
 	}
 	for _, event := range auditEvents {
